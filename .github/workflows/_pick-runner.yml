@@ -18,6 +18,16 @@ name: Pick runner
 # Restore the gate by repopulating scripts/gates/hipaa-repos.txt + restoring the
 # size=1 MIG floor in Cloud Scheduler `runner-mig-scale-down-ig-org`.
 #
+# Root cause (2026-06-21): GITHUB_TOKEN in reusable workflows cannot query
+# /orgs/{org}/actions/runners — the endpoint requires `administration:read`
+# which is NOT in the GITHUB_TOKEN permission set. Even with `permissions: actions: read`
+# on the consumer, the reusable receives a heavily-restricted integration token (403
+# on GET /user). Fix: pass a PAT via secrets.RUNNER_QUERY_PAT (stored in repo secrets).
+# The reusable accepts it via `secrets: runner_query_pat`. Consumers call with:
+#   secrets:
+#     runner_query_pat: ${{ secrets.RUNNER_QUERY_PAT }}
+# GSM canonical name: github__mroot2025__runner-query-pat (project: intelligent-group-ait).
+#
 # Consumer pattern (non-HIPAA):
 #
 #   jobs:
@@ -25,6 +35,8 @@ name: Pick runner
 #       uses: intelligent-group/.github/.github/workflows/_pick-runner.yml@main
 #       with:
 #         weight: heavy   # "light" for lint/typecheck/format; "heavy" for build/test/e2e. Default: heavy (safer).
+#       secrets:
+#         runner_query_pat: ${{ secrets.RUNNER_QUERY_PAT }}
 #     build:
 #       needs: pick
 #       runs-on: ${{ fromJSON(needs.pick.outputs.runs_on) }}
@@ -42,6 +54,10 @@ on:
         required: false
         type: string
         default: heavy
+    secrets:
+      runner_query_pat:
+        description: "PAT with administration:read on this org. GITHUB_TOKEN cannot query the runners API (requires administration:read, not in token permission set). Store in repo secrets as RUNNER_QUERY_PAT."
+        required: false
     outputs:
       runs_on:
         description: "JSON array of labels to feed runs-on"
@@ -49,6 +65,11 @@ on:
       picked:
         description: "Human-readable tier picked: 'pc-cpu', 'mroot-self-hosted', or 'ubuntu-latest'"
         value: ${{ jobs.pick.outputs.picked }}
+
+# NOTE: do NOT add workflow-level permissions: block here. Prior bisect proved
+# that workflow-level permissions: causes startup_failure in this org's GHA config.
+# Root cause is deeper: GITHUB_TOKEN structurally cannot call the runners API.
+# Solution is a PAT passed via secrets.runner_query_pat (see comment above).
 
 jobs:
   pick:
@@ -60,7 +81,10 @@ jobs:
     steps:
       - id: decide
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Use PAT if provided (needed for administration:read on runners API).
+          # Falls back to GITHUB_TOKEN which will always produce empty runner list,
+          # causing all jobs to land on ubuntu-latest.
+          GH_TOKEN: ${{ secrets.runner_query_pat || secrets.GITHUB_TOKEN }}
           WEIGHT:   ${{ inputs.weight }}
         shell: bash
         run: |
@@ -72,19 +96,26 @@ jobs:
           fi
           echo "weight=$WEIGHT"
 
-          # Helper: query runners.  gh api returns 403 JSON on stdout when the token
-          # lacks actions:read scope; we suppress that by catching the exit code
-          # with `|| echo "[]"` so jq always gets valid JSON, then filtering by
-          # .status field (error payloads have no .runners array so jq returns nothing).
+          # Helper: query runners. Requires a PAT with administration:read.
+          # GITHUB_TOKEN cannot query this endpoint (returns 403 or empty list).
+          # Primary: org-level runners (visible to all org repos).
+          # Secondary: repo-level runners (repo-registered runners only visible here).
+          # Results are merged and deduplicated by runner ID before selection.
           ORG="${{ github.repository_owner }}"
+          REPO="${{ github.repository }}"
 
           runners_json() {
-            gh api "orgs/${ORG}/actions/runners?per_page=100" 2>/dev/null || echo '{"runners":[]}'
+            local org_runners repo_runners
+            org_runners=$(gh api "orgs/${ORG}/actions/runners?per_page=100" 2>/dev/null || echo '{"runners":[]}')
+            repo_runners=$(gh api "repos/${REPO}/actions/runners?per_page=100" 2>/dev/null || echo '{"runners":[]}')
+            # Merge + dedupe by runner .id; org runners take precedence
+            printf '%s\n%s' "$org_runners" "$repo_runners" \
+              | jq -s '[ .[0].runners[], .[1].runners[] ] | unique_by(.id)'
           }
 
           # ----- Tier 1: PC self-hosted (always preferred when online+idle) -----
           PICK_PC=$(runners_json | \
-            jq -r '.runners[]? | select((.status=="online") and (.busy==false) and ([.labels[].name] | index("pc-cpu"))) | .name' \
+            jq -r '.[]? | select((.status=="online") and (.busy==false) and ([.labels[].name] | index("pc-cpu"))) | .name' \
             | head -1)
           if [ -n "$PICK_PC" ]; then
             echo "::notice::Picked Tier-1 PC runner: $PICK_PC (weight=$WEIGHT)"
@@ -104,7 +135,7 @@ jobs:
 
           # weight=heavy: try MIG (cheaper per-job for sustained load), else ubuntu-latest
           PICK_MIG=$(runners_json | \
-            jq -r '.runners[]? | select((.status=="online") and (.busy==false) and ([.labels[].name] | index("mroot-self-hosted"))) | .name' \
+            jq -r '.[]? | select((.status=="online") and (.busy==false) and ([.labels[].name] | index("mroot-self-hosted"))) | .name' \
             | head -1)
           if [ -n "$PICK_MIG" ]; then
             echo "::notice::PC offline + weight=heavy; picked Tier-2 MIG: $PICK_MIG"
