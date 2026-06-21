@@ -1,0 +1,60 @@
+name: Pick runner
+
+# Reusable workflow that decides whether to land downstream jobs on the
+# self-hosted PC runner (label: pc-cpu) or fall back to ubuntu-latest.
+#
+# How to consume from any intelligent-group org repo:
+#
+#   jobs:
+#     pick:
+#       uses: intelligent-group/.github/.github/workflows/_pick-runner.yml@main
+#     build:
+#       needs: pick
+#       runs-on: ${{ fromJSON(needs.pick.outputs.runs_on) }}
+#       steps:
+#         - uses: actions/checkout@v4
+#         - run: pnpm install && pnpm test
+#
+# Decision rule: if any runner visible to the calling repo is labeled
+# pc-cpu, status=online, busy=false → use it. Otherwise ubuntu-latest.
+# Costs ~5s of ubuntu-latest per consuming workflow run.
+
+on:
+  workflow_call:
+    outputs:
+      runs_on:
+        description: "JSON array of labels to feed runs-on (e.g. [\"self-hosted\",\"pc-cpu\"] or [\"ubuntu-latest\"])"
+        value: ${{ jobs.pick.outputs.runs_on }}
+      picked:
+        description: "Human-readable: 'pc-cpu' or 'ubuntu-latest'"
+        value: ${{ jobs.pick.outputs.picked }}
+
+permissions:
+  actions: read
+
+jobs:
+  pick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      runs_on: ${{ steps.decide.outputs.runs_on }}
+      picked:  ${{ steps.decide.outputs.picked }}
+    steps:
+      - id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PICK=$(gh api "repos/${{ github.repository }}/actions/runners" \
+            --jq '.runners[]? | select((.status=="online") and (.busy==false) and ([.labels[].name] | index("pc-cpu"))) | .name' \
+            | head -1 || true)
+          if [ -n "$PICK" ]; then
+            echo "::notice::Picked self-hosted runner: $PICK"
+            echo 'runs_on=["self-hosted","pc-cpu"]' >> "$GITHUB_OUTPUT"
+            echo 'picked=pc-cpu' >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No pc-cpu runner online+idle; falling back to ubuntu-latest"
+            echo 'runs_on=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+            echo 'picked=ubuntu-latest' >> "$GITHUB_OUTPUT"
+          fi
