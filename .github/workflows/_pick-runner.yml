@@ -72,10 +72,17 @@ jobs:
           fi
           echo "weight=$WEIGHT"
 
+          # Helper: query org-level runners (works with default read token; repo-level
+          # runners API requires actions:write which reusable workflow callers don't grant).
+          # On 403/4xx the API returns error JSON; filter it with select(.status==...) so
+          # non-runner JSON objects (error payloads) are silently ignored.
+          ORG="${{ github.repository_owner }}"
+
           # ----- Tier 1: PC self-hosted (always preferred when online+idle) -----
-          PICK_PC=$(gh api "repos/${{ github.repository }}/actions/runners" \
+          PICK_PC=$(gh api "orgs/${ORG}/actions/runners" \
+            --paginate \
             --jq '.runners[]? | select((.status=="online") and (.busy==false) and ([.labels[].name] | index("pc-cpu"))) | .name' \
-            | head -1 || true)
+            2>/dev/null | head -1 || true)
           if [ -n "$PICK_PC" ]; then
             echo "::notice::Picked Tier-1 PC runner: $PICK_PC (weight=$WEIGHT)"
             echo 'runs_on=["self-hosted","pc-cpu"]' >> "$GITHUB_OUTPUT"
@@ -93,9 +100,10 @@ jobs:
           fi
 
           # weight=heavy: try MIG (cheaper per-job for sustained load), else ubuntu-latest
-          PICK_MIG=$(gh api "repos/${{ github.repository }}/actions/runners" \
+          PICK_MIG=$(gh api "orgs/${ORG}/actions/runners" \
+            --paginate \
             --jq '.runners[]? | select((.status=="online") and (.busy==false) and ([.labels[].name] | index("mroot-self-hosted"))) | .name' \
-            | head -1 || true)
+            2>/dev/null | head -1 || true)
           if [ -n "$PICK_MIG" ]; then
             echo "::notice::PC offline + weight=heavy; picked Tier-2 MIG: $PICK_MIG"
             echo 'runs_on=["self-hosted","mroot-self-hosted"]' >> "$GITHUB_OUTPUT"
