@@ -54,8 +54,6 @@ jobs:
   pick:
     runs-on: ubuntu-latest
     timeout-minutes: 2
-    permissions:
-      actions: read
     outputs:
       runs_on: ${{ steps.decide.outputs.runs_on }}
       picked:  ${{ steps.decide.outputs.picked }}
