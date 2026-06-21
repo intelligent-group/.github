@@ -2,16 +2,33 @@ name: Pick runner MINIMAL TEST
 
 on:
   workflow_call:
+    inputs:
+      weight:
+        description: "light or heavy"
+        required: false
+        type: string
+        default: heavy
     outputs:
       runs_on:
         description: "JSON array of labels to feed runs-on"
         value: ${{ jobs.pick.outputs.runs_on }}
+      picked:
+        description: "tier picked"
+        value: ${{ jobs.pick.outputs.picked }}
 
 jobs:
   pick:
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
     outputs:
       runs_on: ${{ steps.decide.outputs.runs_on }}
+      picked: ${{ steps.decide.outputs.picked }}
     steps:
       - id: decide
-        run: echo 'runs_on=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WEIGHT: ${{ inputs.weight }}
+        run: |
+          echo 'runs_on=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+          echo 'picked=ubuntu-latest' >> "$GITHUB_OUTPUT"
