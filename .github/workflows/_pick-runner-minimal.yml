@@ -19,15 +19,12 @@ on:
 jobs:
   pick:
     runs-on: ubuntu-latest
-    permissions:
-      actions: read
     outputs:
       runs_on: ${{ steps.decide.outputs.runs_on }}
       picked: ${{ steps.decide.outputs.picked }}
     steps:
       - id: decide
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WEIGHT: ${{ inputs.weight }}
         run: |
           echo 'runs_on=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
