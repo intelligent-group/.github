@@ -106,11 +106,16 @@ jobs:
 
           runners_json() {
             local org_runners repo_runners
-            org_runners=$(gh api "orgs/${ORG}/actions/runners?per_page=100" 2>/dev/null || echo '{"runners":[]}')
-            repo_runners=$(gh api "repos/${REPO}/actions/runners?per_page=100" 2>/dev/null || echo '{"runners":[]}')
-            # Merge + dedupe by runner .id; org runners take precedence
+            # Harden: || only fires on non-zero exit; empty stdout still leaves var empty.
+            # Explicit empty-check ensures fallback JSON even on silent 204/empty responses.
+            org_runners=$(gh api "orgs/${ORG}/actions/runners?per_page=100" 2>/dev/null)
+            [ -z "$org_runners" ] && org_runners='{"runners":[]}'
+            repo_runners=$(gh api "repos/${REPO}/actions/runners?per_page=100" 2>/dev/null)
+            [ -z "$repo_runners" ] && repo_runners='{"runners":[]}'
+            # Merge + dedupe by runner .id; org runners take precedence.
+            # Null-safe: // {} and // [] guard against either API returning non-JSON.
             printf '%s\n%s' "$org_runners" "$repo_runners" \
-              | jq -s '[ .[0].runners[], .[1].runners[] ] | unique_by(.id)'
+              | jq -s '[ ((.[0] // {}).runners // [])[], ((.[1] // {}).runners // [])[] ] | unique_by(.id)'
           }
 
           # ----- Tier 1: PC self-hosted (always preferred when online+idle) -----
