@@ -10,9 +10,13 @@ name: Pick runner
 #
 # Final fallback when EVERYTHING self-hosted is offline: ubuntu-latest.
 #
-# *** NEVER use this workflow for HIPAA-covered repos (scripts/gates/hipaa-repos.txt). ***
-# HIPAA workflows MUST stay on `runs-on: [self-hosted, mroot-self-hosted]` literal —
-# the fallback chain here would route them to PC or ubuntu-latest, both BAA-prohibited.
+# *** HIPAA-FUTURE-NOTE — when the first BAA client signs, restore the hard gate. ***
+# Repos listed in scripts/gates/hipaa-repos.txt must NEVER use this workflow because
+# the fallback chain routes to PC or ubuntu-latest (both BAA-prohibited). The HIPAA
+# gate is currently SUSPENDED (2026-06-21) because there are no BAA clients yet and
+# the demo site `ait-hosted-agents` was paying the HIPAA-floor cost prematurely.
+# Restore the gate by repopulating scripts/gates/hipaa-repos.txt + restoring the
+# size=1 MIG floor in Cloud Scheduler `runner-mig-scale-down-ig-org`.
 #
 # Consumer pattern (non-HIPAA):
 #
