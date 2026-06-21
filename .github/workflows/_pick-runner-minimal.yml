@@ -25,6 +25,7 @@ jobs:
     steps:
       - id: decide
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WEIGHT: ${{ inputs.weight }}
         run: |
           echo 'runs_on=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
