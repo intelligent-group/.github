@@ -50,6 +50,13 @@ on:
         description: "Human-readable tier picked: 'pc-cpu', 'mroot-self-hosted', or 'ubuntu-latest'"
         value: ${{ jobs.pick.outputs.picked }}
 
+# Workflow-level permissions (SAFE — only job-level inside workflow_call triggers
+# the org's startup_failure bug, per commits a0107aa + 5788b59). actions:read is
+# REQUIRED for the gh api runners query to succeed; without it the call returns 403,
+# the error-fallback returns empty, and pre-flight falsely concludes PC offline.
+permissions:
+  actions: read
+
 jobs:
   pick:
     runs-on: ubuntu-latest
