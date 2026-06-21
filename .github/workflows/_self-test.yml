@@ -5,11 +5,9 @@ on:
 
 jobs:
   pick:
-    uses: ./.github/workflows/_pick-runner.yml
-    with:
-      weight: light
+    uses: ./.github/workflows/_pick-runner-minimal.yml
   verify:
     needs: pick
     runs-on: ${{ fromJSON(needs.pick.outputs.runs_on) }}
     steps:
-      - run: echo "picked=${{ needs.pick.outputs.picked }}"
+      - run: echo "runs_on=${{ needs.pick.outputs.runs_on }}"

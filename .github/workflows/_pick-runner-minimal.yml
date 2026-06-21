@@ -1,0 +1,17 @@
+name: Pick runner MINIMAL TEST
+
+on:
+  workflow_call:
+    outputs:
+      runs_on:
+        description: "JSON array of labels to feed runs-on"
+        value: ${{ jobs.pick.outputs.runs_on }}
+
+jobs:
+  pick:
+    runs-on: ubuntu-latest
+    outputs:
+      runs_on: ${{ steps.decide.outputs.runs_on }}
+    steps:
+      - id: decide
+        run: echo 'runs_on=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
