@@ -1,0 +1,15 @@
+name: Self-test pick-runner (DELETE AFTER DIAGNOSIS)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  pick:
+    uses: ./.github/workflows/_pick-runner.yml
+    with:
+      weight: light
+  verify:
+    needs: pick
+    runs-on: ${{ fromJSON(needs.pick.outputs.runs_on) }}
+    steps:
+      - run: echo "picked=${{ needs.pick.outputs.picked }}"
