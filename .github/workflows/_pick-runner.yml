@@ -50,13 +50,12 @@ on:
         description: "Human-readable tier picked: 'pc-cpu', 'mroot-self-hosted', or 'ubuntu-latest'"
         value: ${{ jobs.pick.outputs.picked }}
 
-permissions:
-  actions: read
-
 jobs:
   pick:
     runs-on: ubuntu-latest
     timeout-minutes: 2
+    permissions:
+      actions: read
     outputs:
       runs_on: ${{ steps.decide.outputs.runs_on }}
       picked:  ${{ steps.decide.outputs.picked }}
