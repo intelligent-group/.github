@@ -1,18 +1,26 @@
 name: Pick runner
 
-# Reusable workflow that decides where to land downstream jobs based on
-# runner availability. Decision order (additive — if upper tier is offline,
-# fall back to existing setup):
+# Reusable workflow that decides where to land downstream jobs based on:
+#   1. PC self-hosted runner availability (pc-cpu label) — preferred for ALL weights when online
+#   2. The job's weight (light vs heavy) — when PC is offline
 #
-#   1. PC self-hosted runner (label: pc-cpu)         — preferred when online + idle
-#   2. MIG self-hosted runner (label: mroot-self-hosted) — existing intelligent-group-ait MIG (10x e2-standard-2 preemptible)
-#   3. ubuntu-latest                                 — GH-hosted fallback when everything else is offline
+# Fallback when PC is offline:
+#   - weight=light → ubuntu-latest (uses GH free tier first; cheap per-minute if over)
+#   - weight=heavy → MIG (mroot-self-hosted; ~$0.01/job amortized), then ubuntu-latest if MIG also offline
 #
-# How to consume from any intelligent-group org repo:
+# Final fallback when EVERYTHING self-hosted is offline: ubuntu-latest.
+#
+# *** NEVER use this workflow for HIPAA-covered repos (scripts/gates/hipaa-repos.txt). ***
+# HIPAA workflows MUST stay on `runs-on: [self-hosted, mroot-self-hosted]` literal —
+# the fallback chain here would route them to PC or ubuntu-latest, both BAA-prohibited.
+#
+# Consumer pattern (non-HIPAA):
 #
 #   jobs:
 #     pick:
 #       uses: intelligent-group/.github/.github/workflows/_pick-runner.yml@main
+#       with:
+#         weight: heavy   # "light" for lint/typecheck/format; "heavy" for build/test/e2e. Default: heavy (safer).
 #     build:
 #       needs: pick
 #       runs-on: ${{ fromJSON(needs.pick.outputs.runs_on) }}
@@ -24,12 +32,18 @@ name: Pick runner
 
 on:
   workflow_call:
+    inputs:
+      weight:
+        description: "Job weight: 'light' (lint/typecheck/format/security-scan; <2min, low CPU) or 'heavy' (build/test/e2e/docker; 5-30min, high CPU). Default 'heavy' (safer fallback to MIG)."
+        required: false
+        type: string
+        default: heavy
     outputs:
       runs_on:
         description: "JSON array of labels to feed runs-on"
         value: ${{ jobs.pick.outputs.runs_on }}
       picked:
-        description: "Human-readable tier: 'pc-cpu', 'mroot-self-hosted', or 'ubuntu-latest'"
+        description: "Human-readable tier picked: 'pc-cpu', 'mroot-self-hosted', or 'ubuntu-latest'"
         value: ${{ jobs.pick.outputs.picked }}
 
 permissions:
@@ -46,33 +60,48 @@ jobs:
       - id: decide
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WEIGHT:   ${{ inputs.weight }}
         shell: bash
         run: |
           set -euo pipefail
+          WEIGHT="${WEIGHT:-heavy}"
+          if [ "$WEIGHT" != "light" ] && [ "$WEIGHT" != "heavy" ]; then
+            echo "::warning::invalid weight '$WEIGHT'; defaulting to 'heavy'"
+            WEIGHT=heavy
+          fi
+          echo "weight=$WEIGHT"
 
-          # Tier 1: PC self-hosted (label pc-cpu)
+          # ----- Tier 1: PC self-hosted (always preferred when online+idle) -----
           PICK_PC=$(gh api "repos/${{ github.repository }}/actions/runners" \
             --jq '.runners[]? | select((.status=="online") and (.busy==false) and ([.labels[].name] | index("pc-cpu"))) | .name' \
             | head -1 || true)
           if [ -n "$PICK_PC" ]; then
-            echo "::notice::Picked Tier-1 PC runner: $PICK_PC"
+            echo "::notice::Picked Tier-1 PC runner: $PICK_PC (weight=$WEIGHT)"
             echo 'runs_on=["self-hosted","pc-cpu"]' >> "$GITHUB_OUTPUT"
             echo 'picked=pc-cpu' >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Tier 2: MIG self-hosted (label mroot-self-hosted) — existing intelligent-group-ait MIG fleet
+          # ----- PC offline: branch by weight -----
+          if [ "$WEIGHT" = "light" ]; then
+            # Light tasks → ubuntu-latest first (GH free tier 3000min/mo on private repos)
+            echo "::notice::PC offline + weight=light; routing to ubuntu-latest (cheap)"
+            echo 'runs_on=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+            echo 'picked=ubuntu-latest' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # weight=heavy: try MIG (cheaper per-job for sustained load), else ubuntu-latest
           PICK_MIG=$(gh api "repos/${{ github.repository }}/actions/runners" \
             --jq '.runners[]? | select((.status=="online") and (.busy==false) and ([.labels[].name] | index("mroot-self-hosted"))) | .name' \
             | head -1 || true)
           if [ -n "$PICK_MIG" ]; then
-            echo "::notice::Picked Tier-2 MIG runner: $PICK_MIG"
+            echo "::notice::PC offline + weight=heavy; picked Tier-2 MIG: $PICK_MIG"
             echo 'runs_on=["self-hosted","mroot-self-hosted"]' >> "$GITHUB_OUTPUT"
             echo 'picked=mroot-self-hosted' >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Tier 3: ubuntu-latest (GH-hosted)
-          echo "::notice::No self-hosted runners online+idle; falling back to ubuntu-latest"
+          echo "::notice::PC offline + MIG offline; final fallback to ubuntu-latest"
           echo 'runs_on=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
           echo 'picked=ubuntu-latest' >> "$GITHUB_OUTPUT"
