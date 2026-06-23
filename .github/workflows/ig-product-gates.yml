@@ -1,0 +1,126 @@
+name: IG Product Gates (A-D)
+# Reusable workflow — call from any IG product repo with:
+#   uses: intelligent-group/.github/.github/workflows/ig-product-gates.yml@main
+#   with:
+#     product_url: https://trust.intelligentit.io   # deployed URL (optional — skips D if absent)
+#
+# Gates:
+#   A — Next.js CVE floor (CVE-2025-66478, CVSS 10)
+#   B — Clerk satellite CSP includes FAPI host in script-src / connect-src / frame-src
+#   C — Clerk instance allowed_origins includes product URL (requires CLERK_SECRET_KEY secret)
+#   D — /sign-in route resolves (not 404) at product_url
+#
+# Caller repos must have:
+#   - CLERK_SECRET_KEY repo/env secret (for Gate C)
+#   - product_url input OR set PRODUCT_URL env var for Gates C, D
+
+on:
+  workflow_call:
+    inputs:
+      product_url:
+        description: 'Deployed product URL (e.g. https://trust.intelligentit.io). Required for Gates C and D.'
+        required: false
+        type: string
+        default: ''
+      next_config_path:
+        description: 'Path to next.config.ts (relative to repo root). Default: next.config.ts'
+        required: false
+        type: string
+        default: 'next.config.ts'
+      skip_gate_c:
+        description: 'Set true to skip Gate C (allowed_origins check). Use for repos without Clerk.'
+        required: false
+        type: boolean
+        default: false
+      skip_gate_d:
+        description: 'Set true to skip Gate D (/sign-in probe). Use for non-Next.js repos.'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      CLERK_SECRET_KEY:
+        description: 'Clerk secret key for Gate C (allowed_origins check)'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  gate-a-nextjs-cve:
+    name: 'Gate A — Next.js CVE floor'
+    runs-on: [self-hosted, ig-self-hosted]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Next.js CVE floor
+        shell: bash
+        run: |
+          bash .github/workflows/scripts/check-next-cve-floor.sh
+        # Script exits 1 if vulnerable; prints patched floor + found version.
+
+  gate-b-clerk-csp:
+    name: 'Gate B — Clerk CSP FAPI host'
+    runs-on: [self-hosted, ig-self-hosted]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Clerk CSP includes satellite FAPI host
+        shell: bash
+        run: |
+          bash .github/workflows/scripts/check-clerk-csp-fapi.sh "${{ inputs.next_config_path }}"
+        # Script exits 1 if CSP is missing clerk FAPI host; 0 if ok or no Clerk config.
+
+  gate-c-clerk-allowed-origins:
+    name: 'Gate C — Clerk allowed_origins'
+    runs-on: [self-hosted, ig-self-hosted]
+    if: ${{ !inputs.skip_gate_c && inputs.product_url != '' }}
+    env:
+      CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
+      PRODUCT_URL: ${{ inputs.product_url }}
+    steps:
+      - name: Check Clerk allowed_origins includes product URL
+        shell: bash
+        run: |
+          if [ -z "$CLERK_SECRET_KEY" ]; then
+            echo "::warning::CLERK_SECRET_KEY not set — Gate C skipped"
+            exit 0
+          fi
+          echo "Checking Clerk allowed_origins includes: $PRODUCT_URL"
+          RESPONSE=$(curl -sf https://api.clerk.com/v1/instance \
+            -H "Authorization: Bearer $CLERK_SECRET_KEY" \
+            -H "Content-Type: application/json") || {
+            echo "::error::Clerk API unreachable — check CLERK_SECRET_KEY"
+            exit 1
+          }
+          ORIGINS=$(echo "$RESPONSE" | jq -r '.allowed_origins[]? // empty')
+          if echo "$ORIGINS" | grep -qF "$PRODUCT_URL"; then
+            echo "Gate C PASS: $PRODUCT_URL found in allowed_origins"
+          else
+            echo "::error::Gate C FAIL: $PRODUCT_URL NOT in Clerk allowed_origins"
+            echo "Current origins: $(echo "$RESPONSE" | jq -c '.allowed_origins')"
+            echo "Fix: PATCH https://api.clerk.com/v1/instance with allowed_origins including $PRODUCT_URL"
+            echo "See ait-claude-config skills/new-ig-product/SKILL.md Gate B4 for the exact curl command."
+            exit 1
+          fi
+
+  gate-d-sign-in-route:
+    name: 'Gate D — /sign-in resolves'
+    runs-on: [self-hosted, ig-self-hosted]
+    if: ${{ !inputs.skip_gate_d && inputs.product_url != '' }}
+    env:
+      PRODUCT_URL: ${{ inputs.product_url }}
+    steps:
+      - name: Check /sign-in route is not 404
+        shell: bash
+        run: |
+          SIGN_IN_URL="${PRODUCT_URL%/}/sign-in"
+          echo "Probing: $SIGN_IN_URL"
+          STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+            --max-time 15 --retry 2 --retry-delay 3 \
+            -L "$SIGN_IN_URL" || echo "000")
+          echo "HTTP status: $STATUS"
+          if [ "$STATUS" = "404" ] || [ "$STATUS" = "000" ]; then
+            echo "::error::Gate D FAIL: $SIGN_IN_URL returned $STATUS (expected 200/301/302)"
+            echo "Fix: ensure /sign-in page exists in the Next.js app router (app/sign-in/page.tsx)"
+            exit 1
+          else
+            echo "Gate D PASS: $SIGN_IN_URL → $STATUS"
+          fi
