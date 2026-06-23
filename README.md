@@ -46,7 +46,7 @@ GitHub doesn't broadcast that templates exist. To verify a repo is using
 defaults from here, open it and try to file an issue — you should see
 templates pre-populated from `.github/ISSUE_TEMPLATE/`.
 
-## Why a separate `MRoot2025/.github` repo?
+## Why a separate `intelligent-group/.github` repo?
 
 This is the GitHub-supported pattern for user-level defaults. The
 alternatives (per-repo copies, manual sync, contributor scripts) all drift.
