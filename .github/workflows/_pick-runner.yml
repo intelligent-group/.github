@@ -6,7 +6,7 @@ name: Pick runner
 #
 # Fallback when PC is offline:
 #   - weight=light → ubuntu-latest (uses GH free tier first; cheap per-minute if over)
-#   - weight=heavy → MIG (mroot-self-hosted; ~$0.01/job amortized), then ubuntu-latest if MIG also offline
+#   - weight=heavy → MIG (ig-self-hosted; ~$0.01/job amortized), then ubuntu-latest if MIG also offline
 #
 # Final fallback when EVERYTHING self-hosted is offline: ubuntu-latest.
 #
@@ -63,7 +63,7 @@ on:
         description: "JSON array of labels to feed runs-on"
         value: ${{ jobs.pick.outputs.runs_on }}
       picked:
-        description: "Human-readable tier picked: 'pc-cpu', 'mroot-self-hosted', or 'ubuntu-latest'"
+        description: "Human-readable tier picked: 'pc-cpu', 'ig-self-hosted', or 'ubuntu-latest'"
         value: ${{ jobs.pick.outputs.picked }}
 
 # NOTE: do NOT add workflow-level permissions: block here. Prior bisect proved
@@ -140,12 +140,12 @@ jobs:
 
           # weight=heavy: try MIG (cheaper per-job for sustained load), else ubuntu-latest
           PICK_MIG=$(runners_json | \
-            jq -r '.[]? | select((.status=="online") and (.busy==false) and ([.labels[].name] | index("mroot-self-hosted"))) | .name' \
+            jq -r '.[]? | select((.status=="online") and (.busy==false) and ([.labels[].name] | index("ig-self-hosted"))) | .name' \
             | head -1)
           if [ -n "$PICK_MIG" ]; then
             echo "::notice::PC offline + weight=heavy; picked Tier-2 MIG: $PICK_MIG"
-            echo 'runs_on=["self-hosted","mroot-self-hosted"]' >> "$GITHUB_OUTPUT"
-            echo 'picked=mroot-self-hosted' >> "$GITHUB_OUTPUT"
+            echo 'runs_on=["self-hosted","ig-self-hosted"]' >> "$GITHUB_OUTPUT"
+            echo 'picked=ig-self-hosted' >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
