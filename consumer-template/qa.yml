@@ -1,0 +1,84 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE: .github/workflows/qa.yml   (drop this into YOUR repo)
+# PURPOSE: Intelligent Group org-wide QA gate — calls all three tier workflows.
+#
+# SETUP:
+#   1. Copy this file to your repo at .github/workflows/qa.yml
+#   2. Adjust the inputs below to match your repo (node-version, has-db, has-web)
+#   3. Set org/repo variables:
+#        SELF_HOSTED_READY=true   → once a self-hosted runner is registered
+#        STAGING_URL              → base URL for smoke/E2E tests
+#   4. Add repo secrets (inherit from org secrets if already set):
+#        RUNNER_QUERY_PAT         → PAT with administration:read (for runner picking)
+#        DATABASE_URL             → Postgres connection string (if has-db: true)
+#        SMOKE_API_KEY            → API key for post-deploy smoke (optional)
+#        GITLEAKS_LICENSE         → Gitleaks license key (optional, for private repos)
+#   5. Tier 0 runs on every PR/push — blocking, fast (<5 min on ubuntu-latest).
+#      Tier Heavy + Tier 2 are informational until SELF_HOSTED_READY=true.
+#
+# INPUTS REFERENCE:
+#   node-version  : Node.js version string (default '20')
+#   has-db        : true if repo has DB migrations / pgTAP tests
+#   has-web       : true if repo has a Next.js/browser front-end
+#   package-manager: 'npm' | 'pnpm' | 'yarn' (default 'npm')
+#   base-url      : URL for smoke/DAST/Lighthouse (e.g. 'https://staging.myapp.com')
+#   container-image: Docker image URI for Trivy scan (leave empty to skip)
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: QA
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+
+jobs:
+  # ── Tier 0: Blocking fast gate — runs on every PR/push ──────────────
+  tier0:
+    name: Tier 0 — Fast Gate
+    uses: intelligent-group/.github/.github/workflows/qa-tier0.yml@main
+    with:
+      node-version: "20"          # adjust to your repo's Node version
+      has-db: false               # set true if you have DB migrations
+      has-web: true               # set false for API-only services
+      package-manager: "npm"      # or 'pnpm' / 'yarn'
+      working-directory: "."      # set to 'apps/web' etc. for monorepos
+    secrets: inherit
+
+  # ── Tier Heavy: Comprehensive security + quality (self-hosted) ───────
+  heavy:
+    name: Tier Heavy — Security & Quality
+    needs: tier0                  # only run if Tier 0 passes
+    uses: intelligent-group/.github/.github/workflows/qa-heavy.yml@main
+    with:
+      node-version: "20"
+      has-db: false
+      has-web: true
+      package-manager: "npm"
+      working-directory: "."
+      base-url: ""                # e.g. 'http://localhost:3000' for E2E/DAST
+      container-image: ""         # e.g. 'gcr.io/my-project/my-service:${{ github.sha }}'
+      iac-dir: "."
+    secrets: inherit
+    # NOTE: entire workflow is gated by SELF_HOSTED_READY=true variable.
+    # It will be SKIPPED (not queued) until you set that variable.
+
+  # ── Tier 2: Nightly scheduled suite (also triggerable manually) ──────
+  # This tier runs on schedule (07:17 UTC) from the org .github repo.
+  # Only add this job if you want repo-specific nightly runs on top of
+  # the org-level schedule. Most repos can omit this block.
+  nightly:
+    name: Tier 2 — Scheduled Nightly
+    needs: tier0
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: intelligent-group/.github/.github/workflows/qa-tier2-scheduled.yml@main
+    with:
+      node-version: "20"
+      has-db: false
+      has-web: true
+      package-manager: "npm"
+      working-directory: "."
+      base-url: ""                # set to your staging URL
+    secrets: inherit
+    # NOTE: also gated by SELF_HOSTED_READY=true.

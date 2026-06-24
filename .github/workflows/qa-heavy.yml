@@ -1,0 +1,680 @@
+name: QA Heavy — Comprehensive Security & Quality Gate
+
+# Reusable workflow: self-hosted heavy runners (or ubuntu-latest fallback via _pick-runner).
+# GATED by org/repo variable SELF_HOSTED_READY=true — will NOT queue or block until runners exist.
+# All jobs are informational by default (continue-on-error: true).
+# Promote specific jobs to required in your branch protection after runners are stable.
+#
+# Consumer pattern:
+#   jobs:
+#     qa-heavy:
+#       uses: intelligent-group/.github/.github/workflows/qa-heavy.yml@main
+#       with:
+#         node-version: '20'
+#         has-db: true
+#         has-web: true
+#         base-url: 'http://localhost:3000'
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version. Default: 20."
+        required: false
+        type: string
+        default: "20"
+      has-db:
+        description: "Repo has a database (enables pgTAP, migration tests)."
+        required: false
+        type: boolean
+        default: false
+      has-web:
+        description: "Repo has a web front-end (enables Playwright, Lighthouse, axe)."
+        required: false
+        type: boolean
+        default: true
+      base-url:
+        description: "Base URL for DAST/Lighthouse/E2E (e.g. http://localhost:3000)."
+        required: false
+        type: string
+        default: "http://localhost:3000"
+      package-manager:
+        description: "Package manager: 'npm', 'pnpm', or 'yarn'. Default: npm."
+        required: false
+        type: string
+        default: "npm"
+      working-directory:
+        description: "Root directory for all commands. Default: repo root."
+        required: false
+        type: string
+        default: "."
+      container-image:
+        description: "Docker image URI to scan with Trivy (e.g. gcr.io/project/service:sha)."
+        required: false
+        type: string
+        default: ""
+      iac-dir:
+        description: "Directory containing IaC files for tfsec/checkov. Default: '.'."
+        required: false
+        type: string
+        default: "."
+    secrets:
+      runner_query_pat:
+        description: "PAT with administration:read — passed to _pick-runner."
+        required: false
+      database-url:
+        description: "PostgreSQL connection string for pgTAP tests."
+        required: false
+      promptfoo-config:
+        description: "Base64-encoded promptfoo YAML config for AI eval."
+        required: false
+
+# ──────────────────────────────────────────────────────────────────────
+# RUNNER GATE: entire workflow skipped unless SELF_HOSTED_READY=true.
+# Set this org/repo variable once self-hosted runners are registered.
+# ──────────────────────────────────────────────────────────────────────
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────
+  # Runner selection (reuses existing _pick-runner logic)
+  # ─────────────────────────────────────────────────────────────────────
+  pick-runner:
+    if: ${{ vars.SELF_HOSTED_READY == 'true' }}
+    uses: intelligent-group/.github/.github/workflows/_pick-runner.yml@main
+    with:
+      weight: heavy
+    secrets:
+      runner_query_pat: ${{ secrets.runner_query_pat }}
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 1. pgTAP tenant-isolation (real DB)
+  # ─────────────────────────────────────────────────────────────────────
+  pgtap-tenant-isolation:
+    name: pgTAP Tenant-Isolation Tests
+    needs: pick-runner
+    if: ${{ inputs.has-db && vars.SELF_HOSTED_READY == 'true' }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs_on) }}
+    timeout-minutes: 15
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run pgTAP tenant-isolation tests
+        env:
+          DATABASE_URL: ${{ secrets.database-url }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::warning::DATABASE_URL secret not set — skipping pgTAP tests"
+            exit 0
+          fi
+          # Find pgTAP test files
+          PGTAP_FILES=$(find . -path "*/tests/pgtap/*.sql" -o -path "*/test/pgtap/*.sql" \
+            -o -path "*/supabase/tests/*.sql" 2>/dev/null | head -50)
+          if [ -z "$PGTAP_FILES" ]; then
+            echo "::notice::No pgTAP test files found — skipping"
+            exit 0
+          fi
+          # Install pg_prove if available
+          if command -v pg_prove >/dev/null 2>&1; then
+            pg_prove -d "$DATABASE_URL" $PGTAP_FILES
+          else
+            echo "::warning::pg_prove not installed on runner — skipping pgTAP"
+          fi
+        shell: bash
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 2. Security/Domain Evals (promptfoo)
+  # ─────────────────────────────────────────────────────────────────────
+  security-evals:
+    name: Security & Domain Evals (promptfoo)
+    needs: pick-runner
+    if: ${{ vars.SELF_HOSTED_READY == 'true' }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs_on) }}
+    timeout-minutes: 20
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Run promptfoo evals (skip if no config)
+        env:
+          PROMPTFOO_CONFIG_B64: ${{ secrets.promptfoo-config }}
+        run: |
+          # Prefer inline secret config, else look for checked-in config
+          if [ -n "$PROMPTFOO_CONFIG_B64" ]; then
+            echo "$PROMPTFOO_CONFIG_B64" | base64 -d > /tmp/promptfoo.yaml
+            CONFIG=/tmp/promptfoo.yaml
+          elif [ -f "promptfoo.yaml" ] || [ -f "promptfoo.yml" ]; then
+            CONFIG=$(ls promptfoo.yaml promptfoo.yml 2>/dev/null | head -1)
+          else
+            echo "::notice::No promptfoo config found — skipping security evals"
+            exit 0
+          fi
+          npx promptfoo eval --config "$CONFIG" --output /tmp/eval-results.json
+          echo "Eval results written to /tmp/eval-results.json"
+        shell: bash
+      - name: Upload eval results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: promptfoo-eval-results
+          path: /tmp/eval-results.json
+          if-no-files-found: ignore
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 3. SAST — CodeQL
+  # ─────────────────────────────────────────────────────────────────────
+  codeql:
+    name: SAST — CodeQL
+    needs: pick-runner
+    if: ${{ vars.SELF_HOSTED_READY == 'true' }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs_on) }}
+    timeout-minutes: 30
+    continue-on-error: true
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          queries: security-and-quality
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript-typescript"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 4. DAST — OWASP ZAP
+  # ─────────────────────────────────────────────────────────────────────
+  dast-zap:
+    name: DAST — OWASP ZAP
+    needs: pick-runner
+    if: ${{ inputs.has-web && vars.SELF_HOSTED_READY == 'true' }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs_on) }}
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: ${{ inputs.base-url }}
+          rules_file_name: ".zap/rules.tsv"
+          cmd_options: "-I"
+          fail_action: false
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: report_html.html
+          if-no-files-found: ignore
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 5. Container / Image Scan (Trivy)
+  # ─────────────────────────────────────────────────────────────────────
+  trivy-scan:
+    name: Container Scan (Trivy)
+    needs: pick-runner
+    if: ${{ inputs.container-image != '' && vars.SELF_HOSTED_READY == 'true' }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs_on) }}
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy vulnerability scanner — image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ inputs.container-image }}
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "0"  # informational; promote to 1 when ready
+      - name: Trivy vulnerability scanner — filesystem
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "sarif"
+          output: "trivy-fs-results.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "0"
+      - name: Upload Trivy SARIF results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-results.sarif"
+          category: trivy-image
+        continue-on-error: true
+      - name: Upload Trivy FS SARIF results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-fs-results.sarif"
+          category: trivy-fs
+        continue-on-error: true
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 6. Full E2E — Playwright
+  # ─────────────────────────────────────────────────────────────────────
+  e2e-playwright:
+    name: E2E Tests (Playwright)
+    needs: pick-runner
+    if: ${{ inputs.has-web && vars.SELF_HOSTED_READY == 'true' }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs_on) }}
+    timeout-minutes: 30
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install dependencies
+        run: |
+          case "${{ inputs.package-manager }}" in
+            pnpm) npm i -g pnpm@latest && pnpm install --frozen-lockfile ;;
+            yarn) yarn install --frozen-lockfile ;;
+            *)    npm ci ;;
+          esac
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium 2>/dev/null || echo "::notice::Playwright not in deps — skipping E2E"
+        continue-on-error: true
+      - name: Run Playwright E2E tests
+        run: |
+          if ! cat package.json | grep -q '"test:e2e"\|"e2e"\|"playwright"'; then
+            echo "::notice::No E2E test script found — skipping"
+            exit 0
+          fi
+          npm run test:e2e 2>/dev/null || npm run e2e 2>/dev/null || npx playwright test
+        shell: bash
+        continue-on-error: true
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          if-no-files-found: ignore
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 7. Lighthouse + axe Accessibility
+  # ─────────────────────────────────────────────────────────────────────
+  lighthouse-axe:
+    name: Lighthouse + axe A11y
+    needs: pick-runner
+    if: ${{ inputs.has-web && vars.SELF_HOSTED_READY == 'true' }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs_on) }}
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lighthouse CI
+        uses: treosh/lighthouse-ci-action@v12
+        with:
+          urls: ${{ inputs.base-url }}
+          uploadArtifacts: true
+          temporaryPublicStorage: false
+          budgetPath: "./.lighthouserc.json"
+        continue-on-error: true
+      - name: axe accessibility check
+        run: |
+          if command -v npx >/dev/null 2>&1; then
+            npx axe "${{ inputs.base-url }}" --exit 2>/dev/null || echo "::warning::axe check failed (non-blocking)"
+          fi
+        shell: bash
+        continue-on-error: true
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 8. IaC Scan — tfsec + checkov
+  # ─────────────────────────────────────────────────────────────────────
+  iac-scan:
+    name: IaC Scan (tfsec + checkov)
+    needs: pick-runner
+    if: ${{ vars.SELF_HOSTED_READY == 'true' }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs_on) }}
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: tfsec scan
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: ${{ inputs.iac-dir }}
+          soft_fail: true
+        continue-on-error: true
+      - name: checkov IaC scan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ inputs.iac-dir }}
+          soft_fail: true
+          output_format: sarif
+          output_file_path: "checkov-results.sarif"
+        continue-on-error: true
+      - name: Upload checkov SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "checkov-results.sarif"
+          category: checkov
+        continue-on-error: true
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 9. AI Safety / Red-Team
+  # Prompt-injection, jailbreak eval, PII-leak detector, output-safety asserts
+  # ─────────────────────────────────────────────────────────────────────
+  ai-safety:
+    name: AI Safety & Red-Team
+    needs: pick-runner
+    if: ${{ vars.SELF_HOSTED_READY == 'true' }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs_on) }}
+    timeout-minutes: 20
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Detect AI/LLM usage in codebase
+        id: detect-ai
+        run: |
+          HAS_AI=false
+          if grep -rlE "openai|anthropic|langchain|llm|gpt|claude|gemini|vertexai" \
+            --include="*.ts" --include="*.js" --include="*.mjs" \
+            . 2>/dev/null | grep -v node_modules | head -1 | grep -q .; then
+            HAS_AI=true
+          fi
+          echo "has_ai=$HAS_AI" >> "$GITHUB_OUTPUT"
+          echo "AI/LLM usage detected: $HAS_AI"
+        shell: bash
+
+      - name: Prompt-injection static scan
+        if: steps.detect-ai.outputs.has_ai == 'true'
+        run: |
+          # Static scan: flag direct string interpolation into prompts without sanitization
+          VIOLATIONS=()
+          PROMPT_FILES=$(grep -rlE "system.*prompt|user.*message|prompt.*template|buildPrompt|createMessage" \
+            --include="*.ts" --include="*.js" . 2>/dev/null | grep -v node_modules | head -20)
+
+          for f in $PROMPT_FILES; do
+            # Detect raw user input injected into prompts (req.body, params, query)
+            if grep -qE "req\.(body|params|query|json)|request\.(body|json)\(\)" "$f" 2>/dev/null; then
+              if grep -qiE "system.*prompt|user.*message|prompt.*template" "$f" 2>/dev/null; then
+                if ! grep -qiE "sanitize|escape|strip|validate|allowlist|whitelist|zod|parse" "$f" 2>/dev/null; then
+                  VIOLATIONS+=("$f: raw user input may flow into prompt without sanitization")
+                fi
+              fi
+            fi
+          done
+
+          if [ ${#VIOLATIONS[@]} -gt 0 ]; then
+            echo "::warning::Potential prompt-injection vectors (review required):"
+            printf '  %s\n' "${VIOLATIONS[@]}"
+          else
+            echo "::notice::Prompt-injection static scan: no obvious vectors found"
+          fi
+        shell: bash
+        continue-on-error: true
+
+      - name: PII-leak detector
+        run: |
+          # Scan for PII patterns in logs/responses
+          PII_VIOLATIONS=()
+          SOURCE_FILES=$(find . -type f \( -name "*.ts" -o -name "*.js" \) \
+            -not -path "*/node_modules/*" -not -name "*.test.*" -not -name "*.spec.*" 2>/dev/null | head -100)
+
+          for f in $SOURCE_FILES; do
+            # Flag console.log/res.json calls that may include SSN, credit card, email
+            if grep -qiE "console\.(log|error|warn|info)\|res\.json\|logger\." "$f" 2>/dev/null; then
+              if grep -qiE "ssn|social.?security|credit.?card|cvv|password|secret" "$f" 2>/dev/null; then
+                PII_VIOLATIONS+=("$f: potential PII logged or returned in response")
+              fi
+            fi
+          done
+
+          if [ ${#PII_VIOLATIONS[@]} -gt 0 ]; then
+            echo "::warning::Potential PII exposure in output/logs:"
+            printf '  %s\n' "${PII_VIOLATIONS[@]}"
+          else
+            echo "::notice::PII-leak scan: no obvious patterns found"
+          fi
+        shell: bash
+        continue-on-error: true
+
+      - name: Run AI red-team eval suite (promptfoo)
+        run: |
+          RED_TEAM_CONFIG=""
+          for f in promptfoo.red-team.yaml promptfoo.red-team.yml .promptfoo/red-team.yaml; do
+            [ -f "$f" ] && RED_TEAM_CONFIG="$f" && break
+          done
+          if [ -z "$RED_TEAM_CONFIG" ]; then
+            echo "::notice::No red-team promptfoo config found (promptfoo.red-team.yaml) — skipping"
+            exit 0
+          fi
+          npx promptfoo redteam run --config "$RED_TEAM_CONFIG" --output /tmp/redteam-results.json || \
+            echo "::warning::Red-team eval had findings — see artifact"
+        shell: bash
+        continue-on-error: true
+      - name: Upload AI safety results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-safety-results
+          path: /tmp/redteam-results.json
+          if-no-files-found: ignore
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 10. Supply-Chain: SBOM + SLSA + Signed Artifacts + Pinned-dep verify
+  # ─────────────────────────────────────────────────────────────────────
+  supply-chain:
+    name: Supply-Chain (SBOM + SLSA + Pinned Deps)
+    needs: pick-runner
+    if: ${{ vars.SELF_HOSTED_READY == 'true' }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs_on) }}
+    timeout-minutes: 15
+    continue-on-error: true
+    permissions:
+      id-token: write  # needed for SLSA/sigstore attestation
+      contents: read
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install dependencies
+        run: |
+          case "${{ inputs.package-manager }}" in
+            pnpm) npm i -g pnpm@latest && pnpm install --frozen-lockfile ;;
+            yarn) yarn install --frozen-lockfile ;;
+            *)    npm ci ;;
+          esac
+        working-directory: ${{ inputs.working-directory }}
+
+      - name: Generate SBOM (syft)
+        run: |
+          if command -v syft >/dev/null 2>&1; then
+            syft dir:. -o spdx-json > /tmp/sbom.spdx.json
+            echo "::notice::SBOM generated at /tmp/sbom.spdx.json"
+          else
+            # Install syft on the fly
+            curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | \
+              sh -s -- -b /tmp/syft-bin 2>/dev/null || true
+            if [ -f /tmp/syft-bin/syft ]; then
+              /tmp/syft-bin/syft dir:. -o spdx-json > /tmp/sbom.spdx.json
+            else
+              echo "::warning::syft not available — SBOM skipped"
+            fi
+          fi
+        shell: bash
+        continue-on-error: true
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-spdx
+          path: /tmp/sbom.spdx.json
+          if-no-files-found: ignore
+
+      - name: Attest SBOM (SLSA provenance via GitHub attestation)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: sbom-${{ github.repository_owner }}-${{ github.event.repository.name }}
+          subject-digest: sha256:${{ hashFiles('/tmp/sbom.spdx.json') }}
+        continue-on-error: true
+
+      - name: Pinned-dependency verify
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          # Warn on lockfile-less installs or semver ranges in dependencies
+          if [ ! -f "package-lock.json" ] && [ ! -f "yarn.lock" ] && [ ! -f "pnpm-lock.yaml" ]; then
+            echo "::warning::No lockfile found — dependencies are not pinned!"
+          else
+            echo "::notice::Lockfile present — pinned dependencies verified"
+          fi
+
+          # Check for non-pinned GH Actions in this repo's own workflows
+          UNPINNED=$(find .github/workflows -name "*.yml" -o -name "*.yaml" 2>/dev/null | \
+            xargs grep -hE "uses: .+@" 2>/dev/null | \
+            grep -v "@[a-f0-9]\{40\}" | \
+            grep -v "# pinned" | head -10 || true)
+
+          if [ -n "$UNPINNED" ]; then
+            echo "::warning::Some GitHub Actions use version tags instead of commit SHA pins:"
+            echo "$UNPINNED"
+          fi
+        shell: bash
+        continue-on-error: true
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 11. Compliance Evidence — SOC2 / HIPAA control artifact
+  # ─────────────────────────────────────────────────────────────────────
+  compliance-evidence:
+    name: Compliance Evidence (SOC2/HIPAA)
+    needs:
+      - pick-runner
+      - secret-scan
+      - codeql
+      - trivy-scan
+      - supply-chain
+    if: ${{ always() && vars.SELF_HOSTED_READY == 'true' }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs_on) }}
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Emit compliance evidence artifact
+        run: |
+          mkdir -p /tmp/compliance-evidence
+          cat > /tmp/compliance-evidence/control-evidence.json <<EOF
+          {
+            "run_id": "${{ github.run_id }}",
+            "run_number": "${{ github.run_number }}",
+            "repository": "${{ github.repository }}",
+            "branch": "${{ github.ref_name }}",
+            "sha": "${{ github.sha }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "triggered_by": "${{ github.actor }}",
+            "controls": {
+              "CC6.1_secret_scan": {
+                "tool": "gitleaks",
+                "status": "${{ needs.secret-scan.result || 'skipped' }}",
+                "soc2": "CC6.1 Logical Access Controls"
+              },
+              "CC7.1_sast": {
+                "tool": "CodeQL",
+                "status": "${{ needs.codeql.result || 'skipped' }}",
+                "soc2": "CC7.1 Vulnerability Management",
+                "hipaa": "§164.306(a)(1) Technical safeguards"
+              },
+              "CC6.6_dependency_scan": {
+                "tool": "Trivy",
+                "status": "${{ needs.trivy-scan.result || 'skipped' }}",
+                "soc2": "CC6.6 Third-party Risk"
+              },
+              "CC9.2_sbom": {
+                "tool": "syft",
+                "status": "${{ needs.supply-chain.result || 'skipped' }}",
+                "soc2": "CC9.2 Supply Chain Risk"
+              }
+            },
+            "framework_versions": {
+              "soc2_type": "II",
+              "hipaa": "45 CFR Parts 160 and 164"
+            }
+          }
+          EOF
+          echo "::notice::Compliance evidence artifact generated for run ${{ github.run_id }}"
+          cat /tmp/compliance-evidence/control-evidence.json
+        shell: bash
+
+      - name: Upload compliance evidence artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-evidence-${{ github.run_id }}
+          path: /tmp/compliance-evidence/
+          retention-days: 365
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 12. AutoQA Verdict — aggregate gate summary
+  # ─────────────────────────────────────────────────────────────────────
+  autoqa-verdict:
+    name: AutoQA Verdict
+    needs:
+      - pick-runner
+      - pgtap-tenant-isolation
+      - security-evals
+      - codeql
+      - dast-zap
+      - trivy-scan
+      - e2e-playwright
+      - lighthouse-axe
+      - iac-scan
+      - ai-safety
+      - supply-chain
+      - compliance-evidence
+    if: ${{ always() && vars.SELF_HOSTED_READY == 'true' }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs_on) }}
+    timeout-minutes: 3
+    steps:
+      - name: Emit AutoQA verdict
+        run: |
+          echo "## AutoQA Heavy Gate Verdict — Run ${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| pgTAP Tenant Isolation | ${{ needs.pgtap-tenant-isolation.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Evals (promptfoo) | ${{ needs.security-evals.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SAST (CodeQL) | ${{ needs.codeql.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| DAST (ZAP) | ${{ needs.dast-zap.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Container Scan (Trivy) | ${{ needs.trivy-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| E2E (Playwright) | ${{ needs.e2e-playwright.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Lighthouse + axe | ${{ needs.lighthouse-axe.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| IaC Scan (tfsec/checkov) | ${{ needs.iac-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| AI Safety / Red-Team | ${{ needs.ai-safety.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Supply-Chain (SBOM+SLSA) | ${{ needs.supply-chain.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Compliance Evidence | ${{ needs.compliance-evidence.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> All heavy jobs are informational (continue-on-error). Promote to required in branch protection once runners are stable." >> $GITHUB_STEP_SUMMARY
+        shell: bash

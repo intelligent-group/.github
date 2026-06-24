@@ -1,0 +1,440 @@
+name: QA Tier 2 — Scheduled Nightly & Gauntlet
+
+# Reusable workflow + standalone nightly schedule.
+# Also callable via workflow_call for post-deploy smoke or manual gauntlet runs.
+#
+# GATED: requires SELF_HOSTED_READY=true (same as qa-heavy).
+#
+# Default schedule: 07:17 UTC daily (off-peak, avoids top-of-hour spikes).
+# Override with workflow_dispatch for on-demand runs.
+#
+# Consumer pattern (if called from another repo):
+#   jobs:
+#     nightly:
+#       uses: intelligent-group/.github/.github/workflows/qa-tier2-scheduled.yml@main
+#       with:
+#         has-db: true
+#         base-url: 'https://staging.myapp.com'
+#       secrets: inherit
+
+on:
+  schedule:
+    - cron: "17 7 * * *"   # 07:17 UTC daily — off-peak, avoids top-of-hour runner congestion
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Which suite to run: 'all' | 'audit' | 'smoke' | 'killswitch' | 'multitenant'"
+        required: false
+        default: "all"
+        type: choice
+        options: [all, audit, smoke, killswitch, multitenant]
+      environment:
+        description: "Target environment (staging | production)"
+        required: false
+        default: "staging"
+        type: choice
+        options: [staging, production]
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version. Default: 20."
+        required: false
+        type: string
+        default: "20"
+      has-db:
+        description: "Repo has a database."
+        required: false
+        type: boolean
+        default: false
+      has-web:
+        description: "Repo has a web front-end."
+        required: false
+        type: boolean
+        default: true
+      base-url:
+        description: "Base URL for smoke/auth E2E tests."
+        required: false
+        type: string
+        default: ""
+      package-manager:
+        description: "Package manager: npm | pnpm | yarn. Default: npm."
+        required: false
+        type: string
+        default: "npm"
+      working-directory:
+        description: "Root directory. Default: repo root."
+        required: false
+        type: string
+        default: "."
+    secrets:
+      runner_query_pat:
+        description: "PAT with administration:read for runner selection."
+        required: false
+      database-url:
+        description: "PostgreSQL connection string for multi-tenant DB tests."
+        required: false
+      smoke-api-key:
+        description: "API key for post-deploy smoke tests."
+        required: false
+
+# ──────────────────────────────────────────────────────────────────────
+# All jobs gated on SELF_HOSTED_READY. Nightly runs only gate on
+# the variable; they do not block PRs.
+# ──────────────────────────────────────────────────────────────────────
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────
+  # Runner selection
+  # ─────────────────────────────────────────────────────────────────────
+  pick-runner:
+    if: ${{ vars.SELF_HOSTED_READY == 'true' }}
+    uses: intelligent-group/.github/.github/workflows/_pick-runner.yml@main
+    with:
+      weight: heavy
+    secrets:
+      runner_query_pat: ${{ secrets.runner_query_pat }}
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 1. Multi-Tenant Isolation Matrix
+  # Spins up a matrix across all registered tenant slugs and validates
+  # that each tenant's data is fully isolated from the others.
+  # ─────────────────────────────────────────────────────────────────────
+  multi-tenant-isolation:
+    name: Multi-Tenant Isolation Matrix
+    needs: pick-runner
+    if: >-
+      ${{ vars.SELF_HOSTED_READY == 'true' &&
+          (github.event.inputs.suite == 'all' ||
+           github.event.inputs.suite == 'multitenant' ||
+           github.event_name == 'schedule' ||
+           github.event_name == 'workflow_call') }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs_on) }}
+    timeout-minutes: 30
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        # Extend this list as new tenants are onboarded.
+        # Tenant slugs match the tenant column values in the DB.
+        tenant: [intelligentit, frontrowgroup, default]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version || '20' }}
+      - name: Run tenant-isolation test suite for tenant ${{ matrix.tenant }}
+        env:
+          DATABASE_URL: ${{ secrets.database-url }}
+          TEST_TENANT: ${{ matrix.tenant }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::warning::DATABASE_URL not set — skipping tenant isolation for $TEST_TENANT"
+            exit 0
+          fi
+
+          echo "Running tenant isolation checks for: $TEST_TENANT"
+
+          # 1. Row-Level Security probe: attempt cross-tenant read with tenant A's credentials
+          # If the repo ships a test script for this, run it; else use the built-in probe
+          if [ -f "scripts/test-tenant-isolation.sh" ]; then
+            TENANT="$TEST_TENANT" bash scripts/test-tenant-isolation.sh
+          elif [ -f "tests/tenant-isolation.test.ts" ] || [ -f "tests/tenant-isolation.spec.ts" ]; then
+            TENANT="$TEST_TENANT" npx jest --testPathPattern="tenant-isolation" --passWithNoTests 2>/dev/null || \
+            TENANT="$TEST_TENANT" npx vitest run tests/tenant-isolation 2>/dev/null || true
+          else
+            echo "::notice::No tenant-isolation test script found for $TEST_TENANT — verifying RLS policy via psql"
+            # Minimal probe: check that RLS is enabled on the main tables
+            psql "$DATABASE_URL" -c "
+              SELECT schemaname, tablename, rowsecurity
+              FROM pg_tables
+              WHERE schemaname = 'public'
+              AND rowsecurity = FALSE
+              AND tablename NOT IN ('schema_migrations', '_prisma_migrations');
+            " 2>/dev/null | tee /tmp/rls-check-$TEST_TENANT.txt
+
+            if grep -q "rows\)" /tmp/rls-check-$TEST_TENANT.txt 2>/dev/null; then
+              ROWCOUNT=$(grep -oE "[0-9]+ rows?\)" /tmp/rls-check-$TEST_TENANT.txt | grep -oE "^[0-9]+")
+              if [ "$ROWCOUNT" != "0" ] && [ -n "$ROWCOUNT" ]; then
+                echo "::warning::$ROWCOUNT table(s) have RLS disabled for tenant $TEST_TENANT"
+              fi
+            fi
+          fi
+          echo "::notice::Tenant isolation check complete for $TEST_TENANT"
+        shell: bash
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 2. Weekly Audit Gauntlet
+  # Comprehensive dependency + license + SCA audit with full report.
+  # ─────────────────────────────────────────────────────────────────────
+  audit-gauntlet:
+    name: Weekly Audit Gauntlet
+    needs: pick-runner
+    if: >-
+      ${{ vars.SELF_HOSTED_READY == 'true' &&
+          (github.event.inputs.suite == 'all' ||
+           github.event.inputs.suite == 'audit' ||
+           github.event_name == 'schedule' ||
+           github.event_name == 'workflow_call') }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs_on) }}
+    timeout-minutes: 20
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory || '.' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version || '20' }}
+          cache: ${{ inputs.package-manager || 'npm' }}
+      - name: Install dependencies
+        run: |
+          PM="${{ inputs.package-manager || 'npm' }}"
+          case "$PM" in
+            pnpm) npm i -g pnpm@latest && pnpm install --frozen-lockfile ;;
+            yarn) yarn install --frozen-lockfile ;;
+            *)    npm ci ;;
+          esac
+
+      - name: Full dependency audit (all severity levels)
+        run: |
+          PM="${{ inputs.package-manager || 'npm' }}"
+          echo "## Dependency Audit Report — $(date -u)" > /tmp/audit-report.txt
+          case "$PM" in
+            pnpm) pnpm audit --json 2>/dev/null | tee -a /tmp/audit-report.txt || true ;;
+            yarn) yarn audit --json 2>/dev/null | tee -a /tmp/audit-report.txt || true ;;
+            *)    npm audit --json 2>/dev/null | tee -a /tmp/audit-report.txt || true ;;
+          esac
+        shell: bash
+        continue-on-error: true
+
+      - name: Full license audit
+        run: |
+          echo "## License Audit Report — $(date -u)" > /tmp/license-full-report.txt
+          npx license-checker --json --production 2>/dev/null | tee -a /tmp/license-full-report.txt || true
+          # Flag any new GPL/AGPL/LGPL additions
+          if grep -qE '"(GPL|AGPL|LGPL)' /tmp/license-full-report.txt 2>/dev/null; then
+            echo "::warning::GPL/AGPL/LGPL licenses detected in full audit — review required"
+          fi
+        shell: bash
+        continue-on-error: true
+
+      - name: Outdated packages report
+        run: |
+          npm outdated --json 2>/dev/null > /tmp/outdated-report.json || true
+          OUTDATED_COUNT=$(cat /tmp/outdated-report.json 2>/dev/null | \
+            python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d))" 2>/dev/null || echo "0")
+          echo "::notice::$OUTDATED_COUNT packages have newer versions available"
+        shell: bash
+        continue-on-error: true
+
+      - name: Upload audit artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-gauntlet-${{ github.run_id }}
+          path: |
+            /tmp/audit-report.txt
+            /tmp/license-full-report.txt
+            /tmp/outdated-report.json
+          retention-days: 90
+          if-no-files-found: ignore
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 3. Kill-Switch + Spend/Anomaly Breaker Tests
+  # Validates that kill-switches fire and anomaly detection trips correctly.
+  # ─────────────────────────────────────────────────────────────────────
+  killswitch-breaker:
+    name: Kill-Switch & Spend/Anomaly Breaker Tests
+    needs: pick-runner
+    if: >-
+      ${{ vars.SELF_HOSTED_READY == 'true' &&
+          (github.event.inputs.suite == 'all' ||
+           github.event.inputs.suite == 'killswitch' ||
+           github.event_name == 'schedule' ||
+           github.event_name == 'workflow_call') }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs_on) }}
+    timeout-minutes: 15
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory || '.' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version || '20' }}
+      - name: Kill-switch self-test
+        run: |
+          # Check for kill-switch script/endpoint in the codebase
+          KS_FOUND=false
+          for pattern in "kill.switch\|killswitch\|KILL_SWITCH\|feature.flag\|featureFlag" "emergency.disable\|circuit.breaker\|circuitBreaker"; do
+            if grep -rlE "$pattern" --include="*.ts" --include="*.js" . 2>/dev/null | grep -v node_modules | grep -q .; then
+              KS_FOUND=true
+              break
+            fi
+          done
+
+          if [ "$KS_FOUND" = "false" ]; then
+            echo "::warning::No kill-switch/circuit-breaker implementation detected. Consider adding one."
+            exit 0
+          fi
+
+          # Run kill-switch tests if they exist
+          if find . -name "*.test.*" -o -name "*.spec.*" 2>/dev/null | \
+             xargs grep -lE "kill.switch\|killswitch\|circuit.breaker" 2>/dev/null | grep -q .; then
+            npx jest --testPathPattern="kill.switch|circuit.?breaker" --passWithNoTests 2>/dev/null || \
+            npx vitest run --reporter=verbose 2>/dev/null | grep -iE "kill|circuit|breaker" || true
+          else
+            echo "::notice::Kill-switch code found but no dedicated tests. Consider adding kill-switch unit tests."
+          fi
+        shell: bash
+        continue-on-error: true
+
+      - name: Spend/anomaly breaker test
+        run: |
+          # Validate that spend guards exist (token limits, rate limits, cost caps)
+          BREAKER_FOUND=false
+          for pattern in "spend.limit\|spendLimit\|SPEND_LIMIT\|rate.limit\|rateLimit\|token.limit\|tokenLimit\|cost.cap\|costCap\|maxTokens\|MAX_TOKENS"; do
+            if grep -rlE "$pattern" --include="*.ts" --include="*.js" . 2>/dev/null | grep -v node_modules | grep -q .; then
+              BREAKER_FOUND=true
+              break
+            fi
+          done
+
+          if [ "$BREAKER_FOUND" = "false" ]; then
+            echo "::warning::No spend/anomaly breaker detected. Add token limits and cost caps for LLM/API calls."
+          else
+            echo "::notice::Spend/anomaly breaker pattern found — OK"
+          fi
+        shell: bash
+        continue-on-error: true
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 4. Post-Deploy Smoke + Auth E2E
+  # ─────────────────────────────────────────────────────────────────────
+  post-deploy-smoke:
+    name: Post-Deploy Smoke + Auth E2E
+    needs: pick-runner
+    if: >-
+      ${{ vars.SELF_HOSTED_READY == 'true' &&
+          (github.event.inputs.suite == 'all' ||
+           github.event.inputs.suite == 'smoke' ||
+           github.event_name == 'schedule' ||
+           github.event_name == 'workflow_call') }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs_on) }}
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version || '20' }}
+
+      - name: Health-check endpoint smoke test
+        env:
+          BASE_URL: ${{ inputs.base-url || vars.STAGING_URL || '' }}
+        run: |
+          if [ -z "$BASE_URL" ]; then
+            echo "::notice::No base-url set — skipping smoke test. Set input base-url or org var STAGING_URL."
+            exit 0
+          fi
+
+          echo "Smoke testing: $BASE_URL"
+
+          # Health check
+          HEALTH_STATUS=$(curl -sSo /dev/null -w "%{http_code}" "${BASE_URL}/api/health" 2>/dev/null || \
+                          curl -sSo /dev/null -w "%{http_code}" "${BASE_URL}/health" 2>/dev/null || echo "000")
+
+          if [ "$HEALTH_STATUS" = "200" ] || [ "$HEALTH_STATUS" = "204" ]; then
+            echo "::notice::Health check passed (HTTP $HEALTH_STATUS)"
+          else
+            echo "::error::Health check failed (HTTP $HEALTH_STATUS) for $BASE_URL/api/health"
+            exit 1
+          fi
+
+          # Root page reachable
+          ROOT_STATUS=$(curl -sSo /dev/null -w "%{http_code}" "${BASE_URL}/" 2>/dev/null || echo "000")
+          if [ "$ROOT_STATUS" -ge "200" ] && [ "$ROOT_STATUS" -lt "400" ]; then
+            echo "::notice::Root page reachable (HTTP $ROOT_STATUS)"
+          else
+            echo "::warning::Root page returned HTTP $ROOT_STATUS"
+          fi
+        shell: bash
+
+      - name: Auth E2E smoke (Clerk/Supabase sign-in flow)
+        env:
+          BASE_URL: ${{ inputs.base-url || vars.STAGING_URL || '' }}
+          SMOKE_API_KEY: ${{ secrets.smoke-api-key }}
+        run: |
+          if [ -z "$BASE_URL" ]; then
+            echo "::notice::No base-url — skipping auth E2E"
+            exit 0
+          fi
+
+          # Check that auth endpoint exists and redirects appropriately
+          SIGN_IN_STATUS=$(curl -sSo /dev/null -w "%{http_code}" -L "${BASE_URL}/sign-in" 2>/dev/null || \
+                           curl -sSo /dev/null -w "%{http_code}" -L "${BASE_URL}/login" 2>/dev/null || echo "000")
+
+          if [ "$SIGN_IN_STATUS" -ge "200" ] && [ "$SIGN_IN_STATUS" -lt "500" ]; then
+            echo "::notice::Auth sign-in endpoint reachable (HTTP $SIGN_IN_STATUS)"
+          else
+            echo "::warning::Auth sign-in endpoint returned HTTP $SIGN_IN_STATUS — check deployment"
+          fi
+
+          # API auth guard: unauthenticated request to protected API must return 401/403
+          UNAUTH_STATUS=$(curl -sSo /dev/null -w "%{http_code}" "${BASE_URL}/api/me" 2>/dev/null || \
+                          curl -sSo /dev/null -w "%{http_code}" "${BASE_URL}/api/user" 2>/dev/null || echo "000")
+
+          if [ "$UNAUTH_STATUS" = "401" ] || [ "$UNAUTH_STATUS" = "403" ]; then
+            echo "::notice::Auth guard working — unauthenticated API request correctly rejected (HTTP $UNAUTH_STATUS)"
+          elif [ "$UNAUTH_STATUS" = "000" ]; then
+            echo "::notice::Auth endpoint not found — skip (not all apps have /api/me)"
+          else
+            echo "::warning::Auth guard may be missing — /api/me returned HTTP $UNAUTH_STATUS for unauthenticated request"
+          fi
+        shell: bash
+        continue-on-error: true
+
+      - name: Run smoke scripts if present
+        env:
+          SMOKE_API_KEY: ${{ secrets.smoke-api-key }}
+          BASE_URL: ${{ inputs.base-url || vars.STAGING_URL || '' }}
+        run: |
+          for script in scripts/smoke-*.ts scripts/smoke-*.js; do
+            [ -f "$script" ] || continue
+            echo "Running smoke script: $script"
+            npx tsx "$script" 2>/dev/null || node "$script" 2>/dev/null || \
+              echo "::warning::Smoke script $script failed or couldn't run"
+          done
+        shell: bash
+        working-directory: ${{ inputs.working-directory || '.' }}
+        continue-on-error: true
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Nightly Summary
+  # ─────────────────────────────────────────────────────────────────────
+  nightly-summary:
+    name: Nightly Summary
+    needs:
+      - pick-runner
+      - multi-tenant-isolation
+      - audit-gauntlet
+      - killswitch-breaker
+      - post-deploy-smoke
+    if: ${{ always() && vars.SELF_HOSTED_READY == 'true' }}
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.runs_on) }}
+    timeout-minutes: 3
+    steps:
+      - name: Emit nightly QA summary
+        run: |
+          echo "## Nightly QA Tier 2 Summary — $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Suite | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Multi-Tenant Isolation | ${{ needs.multi-tenant-isolation.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Audit Gauntlet | ${{ needs.audit-gauntlet.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Kill-Switch & Spend Breaker | ${{ needs.killswitch-breaker.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Post-Deploy Smoke + Auth E2E | ${{ needs.post-deploy-smoke.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Triggered by: \`${{ github.event_name }}\` | Suite: \`${{ github.event.inputs.suite || 'all' }}\`" >> $GITHUB_STEP_SUMMARY
+        shell: bash

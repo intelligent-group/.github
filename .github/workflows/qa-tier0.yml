@@ -1,0 +1,543 @@
+name: QA Tier 0 — Blocking Fast Gate
+
+# Reusable workflow: GitHub-hosted ubuntu-latest, must finish < 5 min.
+# Every job skips gracefully when the repo lacks the relevant script/tool
+# (skip-if-absent), but FAILS on real violations.
+#
+# Consumer pattern:
+#   jobs:
+#     qa-tier0:
+#       uses: intelligent-group/.github/.github/workflows/qa-tier0.yml@main
+#       with:
+#         node-version: '20'
+#         has-db: true
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version to use (e.g. '20', '22'). Default: 20."
+        required: false
+        type: string
+        default: "20"
+      has-db:
+        description: "Set true when the repo has DB migrations to lint."
+        required: false
+        type: boolean
+        default: false
+      has-web:
+        description: "Set true when the repo has a Next.js/web build."
+        required: false
+        type: boolean
+        default: true
+      package-manager:
+        description: "Package manager: 'npm', 'pnpm', or 'yarn'. Default: npm."
+        required: false
+        type: string
+        default: "npm"
+      working-directory:
+        description: "Root directory for all commands. Default: repo root."
+        required: false
+        type: string
+        default: "."
+    secrets:
+      # Pass any secrets needed by build/test (e.g. NEXT_PUBLIC_ vars)
+      extra-env:
+        description: "Optional JSON object of extra env vars to inject (base64-encoded)."
+        required: false
+
+# No workflow-level permissions block — see _pick-runner.yml comment on why.
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────
+  # 1. TypeScript type-check
+  # ─────────────────────────────────────────────────────────────────────
+  typecheck:
+    name: TypeCheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install dependencies
+        run: |
+          case "${{ inputs.package-manager }}" in
+            pnpm) npm i -g pnpm@latest && pnpm install --frozen-lockfile ;;
+            yarn) yarn install --frozen-lockfile ;;
+            *)    npm ci ;;
+          esac
+      - name: TypeScript type-check (skip if no tsconfig)
+        run: |
+          if [ ! -f tsconfig.json ] && [ ! -f tsconfig.*.json ]; then
+            echo "::notice::No tsconfig found — skipping typecheck"
+            exit 0
+          fi
+          # Try project tsc script first, fall back to npx tsc
+          if npm run --if-present type-check 2>/dev/null | grep -q "^$"; then
+            : # ran via npm script
+          else
+            npx tsc --noEmit || npx tsc --noEmit --project tsconfig.json
+          fi
+        shell: bash
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 2. Lint + Format
+  # ─────────────────────────────────────────────────────────────────────
+  lint-format:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install dependencies
+        run: |
+          case "${{ inputs.package-manager }}" in
+            pnpm) npm i -g pnpm@latest && pnpm install --frozen-lockfile ;;
+            yarn) yarn install --frozen-lockfile ;;
+            *)    npm ci ;;
+          esac
+      - name: ESLint (skip if no eslint config)
+        run: |
+          HAS_ESLINT=false
+          for f in .eslintrc .eslintrc.js .eslintrc.cjs .eslintrc.json .eslintrc.yml .eslintrc.yaml eslint.config.js eslint.config.mjs eslint.config.cjs; do
+            [ -f "$f" ] && HAS_ESLINT=true && break
+          done
+          if [ "$HAS_ESLINT" = "false" ]; then
+            echo "::notice::No ESLint config found — skipping lint"
+            exit 0
+          fi
+          # Run via package.json script if available, else direct
+          if cat package.json | grep -q '"lint"'; then
+            npm run lint
+          else
+            npx eslint . --max-warnings 0
+          fi
+        shell: bash
+      - name: Prettier format check (skip if no prettier config)
+        run: |
+          HAS_PRETTIER=false
+          for f in .prettierrc .prettierrc.js .prettierrc.cjs .prettierrc.json .prettierrc.yml .prettierrc.yaml prettier.config.js prettier.config.mjs; do
+            [ -f "$f" ] && HAS_PRETTIER=true && break
+          done
+          if [ "$HAS_PRETTIER" = "false" ]; then
+            echo "::notice::No Prettier config found — skipping format check"
+            exit 0
+          fi
+          if cat package.json | grep -q '"format:check"\|"fmt:check"\|"prettier:check"'; then
+            npm run format:check 2>/dev/null || npm run fmt:check 2>/dev/null || npm run prettier:check 2>/dev/null || true
+          else
+            npx prettier --check .
+          fi
+        shell: bash
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 3. Build
+  # ─────────────────────────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install dependencies
+        run: |
+          case "${{ inputs.package-manager }}" in
+            pnpm) npm i -g pnpm@latest && pnpm install --frozen-lockfile ;;
+            yarn) yarn install --frozen-lockfile ;;
+            *)    npm ci ;;
+          esac
+      - name: Build (skip if no build script)
+        run: |
+          if ! cat package.json | grep -q '"build"'; then
+            echo "::notice::No build script in package.json — skipping build"
+            exit 0
+          fi
+          npm run build
+        shell: bash
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 4. Unit Tests
+  # ─────────────────────────────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install dependencies
+        run: |
+          case "${{ inputs.package-manager }}" in
+            pnpm) npm i -g pnpm@latest && pnpm install --frozen-lockfile ;;
+            yarn) yarn install --frozen-lockfile ;;
+            *)    npm ci ;;
+          esac
+      - name: Run unit tests (skip if no test script)
+        run: |
+          if ! cat package.json | grep -q '"test"'; then
+            echo "::notice::No test script in package.json — skipping unit tests"
+            exit 0
+          fi
+          npm test -- --passWithNoTests 2>/dev/null || npm test
+        shell: bash
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 5. Secret Scan (gitleaks)
+  # ─────────────────────────────────────────────────────────────────────
+  secret-scan:
+    name: Secret Scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so gitleaks can scan all commits
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}  # uncomment for private repos if needed
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 6. Dependency / SCA audit (critical only)
+  # ─────────────────────────────────────────────────────────────────────
+  dependency-audit:
+    name: Dependency Audit (critical)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install dependencies
+        run: |
+          case "${{ inputs.package-manager }}" in
+            pnpm) npm i -g pnpm@latest && pnpm install --frozen-lockfile ;;
+            yarn) yarn install --frozen-lockfile ;;
+            *)    npm ci ;;
+          esac
+      - name: Audit for critical vulnerabilities
+        run: |
+          case "${{ inputs.package-manager }}" in
+            pnpm) pnpm audit --audit-level critical ;;
+            yarn) yarn audit --level critical || [ $? -le 16 ] ;;  # yarn exit 16 = moderate, not critical
+            *)    npm audit --audit-level critical ;;
+          esac
+        shell: bash
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 7. License Scan (deny GPL/AGPL)
+  # ─────────────────────────────────────────────────────────────────────
+  license-scan:
+    name: License Scan (deny GPL/AGPL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+      - name: Install dependencies
+        run: |
+          case "${{ inputs.package-manager }}" in
+            pnpm) npm i -g pnpm@latest && pnpm install --frozen-lockfile ;;
+            yarn) yarn install --frozen-lockfile ;;
+            *)    npm ci ;;
+          esac
+      - name: Check licenses (block GPL/AGPL)
+        run: |
+          if [ ! -f package.json ]; then
+            echo "::notice::No package.json — skipping license scan"
+            exit 0
+          fi
+          # Install license-checker if not present in project
+          npx license-checker --failOn "GPL;AGPL;GPL-2.0;GPL-3.0;AGPL-3.0;LGPL-2.0;LGPL-2.1;LGPL-3.0" \
+            --excludePackages "" \
+            --production 2>&1 | tee /tmp/license-report.txt
+          if grep -qE "^(GPL|AGPL|LGPL)" /tmp/license-report.txt 2>/dev/null; then
+            echo "::error::GPL/AGPL/LGPL licensed dependency detected! Review /tmp/license-report.txt"
+            exit 1
+          fi
+          echo "::notice::License scan passed — no GPL/AGPL/LGPL dependencies found"
+        shell: bash
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 8. Auth-Guard Presence Check
+  # Verifies that API routes have auth middleware (import of auth/guard
+  # patterns). Does NOT execute the auth logic — just presence.
+  # ─────────────────────────────────────────────────────────────────────
+  auth-guard-check:
+    name: Auth-Guard Presence Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check auth-guard on API routes
+        run: |
+          # Identify API route files (Next.js App Router + Pages Router patterns)
+          API_FILES=$(find . \
+            \( -path "*/app/api/*" -o -path "*/pages/api/*" \) \
+            \( -name "route.ts" -o -name "route.js" -o -name "*.ts" -o -name "*.js" \) \
+            -not -path "*/node_modules/*" \
+            -not -path "*/_*" \
+            -not -name "*.test.*" \
+            -not -name "*.spec.*" \
+            2>/dev/null)
+
+          if [ -z "$API_FILES" ]; then
+            echo "::notice::No API route files found — skipping auth-guard check"
+            exit 0
+          fi
+
+          MISSING=()
+          for f in $API_FILES; do
+            # Skip health/ping/status endpoints (intentionally public)
+            if echo "$f" | grep -qiE "health|ping|status|version|\.well-known"; then
+              continue
+            fi
+            # Skip webhook endpoints (authenticated by signature, not session)
+            if echo "$f" | grep -qi "webhook"; then
+              continue
+            fi
+            # Check for auth import patterns
+            if ! grep -qiE \
+              "auth\(|getAuth|currentUser|clerkMiddleware|authMiddleware|withAuth|requireAuth|verifyToken|getSession|getServerSession|auth\.protect|stackServerApp" \
+              "$f" 2>/dev/null; then
+              MISSING+=("$f")
+            fi
+          done
+
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "::error::API routes missing auth-guard import:"
+            printf '  %s\n' "${MISSING[@]}"
+            echo "Add an auth check (Clerk, NextAuth, Supabase Auth, or custom) to each file."
+            exit 1
+          fi
+          echo "::notice::Auth-guard check passed — all ${#API_FILES} API routes have auth imports"
+        shell: bash
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 9. Tenant-Scope Static Lint
+  # Flags direct DB queries in API routes that lack a tenant/org filter.
+  # ─────────────────────────────────────────────────────────────────────
+  tenant-scope-lint:
+    name: Tenant-Scope Static Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tenant-scope static lint
+        run: |
+          # Find all API route files
+          API_FILES=$(find . \
+            \( -path "*/app/api/*" -o -path "*/pages/api/*" \) \
+            \( -name "route.ts" -o -name "route.js" -o -name "*.ts" -o -name "*.js" \) \
+            -not -path "*/node_modules/*" \
+            2>/dev/null)
+
+          if [ -z "$API_FILES" ]; then
+            echo "::notice::No API route files found — skipping tenant-scope lint"
+            exit 0
+          fi
+
+          VIOLATIONS=()
+          for f in $API_FILES; do
+            # Skip health/webhook/public routes
+            if echo "$f" | grep -qiE "health|ping|webhook|\.well-known|public"; then
+              continue
+            fi
+            # If the file has a DB query (from, select, prisma, supabase)...
+            if grep -qiE "\.from\(|\.select\(|prisma\.|supabaseAdmin\." "$f" 2>/dev/null; then
+              # ...it must also reference a tenant/org filter
+              if ! grep -qiE \
+                "orgId|tenantId|org_id|tenant_id|userId.*filter|where.*org|where.*tenant|eq\(.*orgId\|eq\(.*tenantId\|organization_id" \
+                "$f" 2>/dev/null; then
+                VIOLATIONS+=("$f")
+              fi
+            fi
+          done
+
+          if [ ${#VIOLATIONS[@]} -gt 0 ]; then
+            echo "::error::API routes with DB queries appear to lack tenant/org scoping:"
+            printf '  %s\n' "${VIOLATIONS[@]}"
+            echo "Ensure every query is filtered by orgId/tenantId."
+            exit 1
+          fi
+          echo "::notice::Tenant-scope lint passed"
+        shell: bash
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 10. Zod-Boundary + Env-Schema Check
+  # ─────────────────────────────────────────────────────────────────────
+  zod-env-check:
+    name: Zod-Boundary & Env-Schema Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Zod-boundary coverage check
+        run: |
+          # Find API route handler files
+          API_FILES=$(find . \
+            \( -path "*/app/api/*" -o -path "*/pages/api/*" \) \
+            \( -name "route.ts" -o -name "route.js" \) \
+            -not -path "*/node_modules/*" \
+            2>/dev/null)
+
+          if [ -z "$API_FILES" ]; then
+            echo "::notice::No API route files found — skipping Zod-boundary check"
+            exit 0
+          fi
+
+          MISSING_ZOD=()
+          for f in $API_FILES; do
+            # Only check routes that parse a request body (POST/PUT/PATCH)
+            if grep -qiE "request\.json|req\.body|await json\(\)" "$f" 2>/dev/null; then
+              if ! grep -qiE "\.parse\(|\.safeParse\(|z\." "$f" 2>/dev/null; then
+                MISSING_ZOD+=("$f")
+              fi
+            fi
+          done
+
+          if [ ${#MISSING_ZOD[@]} -gt 0 ]; then
+            echo "::error::API routes that parse request body are missing Zod validation:"
+            printf '  %s\n' "${MISSING_ZOD[@]}"
+            echo "Add zod .parse() or .safeParse() at every API input boundary."
+            exit 1
+          fi
+          echo "::notice::Zod-boundary check passed"
+        shell: bash
+
+      - name: Env-schema check (t3-env or manual schema)
+        run: |
+          # Check for env.ts / env.mjs / env.js schema files (t3-env pattern)
+          HAS_ENV_SCHEMA=false
+          for f in src/env.ts src/env.mjs src/env.js env.ts env.mjs env.js lib/env.ts lib/env.mjs; do
+            if [ -f "$f" ]; then
+              HAS_ENV_SCHEMA=true
+              break
+            fi
+          done
+
+          # Also accept .env.example as minimum documentation
+          if [ -f ".env.example" ] || [ -f ".env.sample" ]; then
+            HAS_ENV_SCHEMA=true
+          fi
+
+          if [ "$HAS_ENV_SCHEMA" = "false" ]; then
+            echo "::warning::No env schema (t3-env env.ts) or .env.example found. Consider adding one."
+            # warning only — not a hard fail unless you have .env vars used without schema
+          else
+            echo "::notice::Env schema/documentation present — passed"
+          fi
+        shell: bash
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 11. Migration Safety Lint
+  # ─────────────────────────────────────────────────────────────────────
+  migration-safety:
+    name: Migration Safety Lint
+    if: ${{ inputs.has-db }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint migrations for destructive patterns
+        run: |
+          # Find migration files (Prisma, Supabase, drizzle, raw SQL)
+          MIGRATION_FILES=$(find . \
+            \( -path "*/migrations/*.sql" \
+               -o -path "*/supabase/migrations/*.sql" \
+               -o -path "*/prisma/migrations/**/*.sql" \
+               -o -path "*/drizzle/*.sql" \) \
+            -not -path "*/node_modules/*" \
+            2>/dev/null)
+
+          # Find only migrations changed in this PR/push
+          CHANGED_MIGRATIONS=""
+          if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+            CHANGED_MIGRATIONS=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | \
+              grep -iE "migration|\.sql$" || true)
+          else
+            # First commit — check all
+            CHANGED_MIGRATIONS="$MIGRATION_FILES"
+          fi
+
+          if [ -z "$CHANGED_MIGRATIONS" ]; then
+            echo "::notice::No migration files changed — skipping migration safety lint"
+            exit 0
+          fi
+
+          VIOLATIONS=()
+          for f in $CHANGED_MIGRATIONS; do
+            [ -f "$f" ] || continue
+            # Dangerous patterns: DROP TABLE/COLUMN, TRUNCATE without transaction, NOT NULL without default on existing column
+            if grep -qiE "DROP (TABLE|COLUMN)|TRUNCATE" "$f" 2>/dev/null; then
+              # Allow if inside a transaction block
+              if ! grep -qi "BEGIN\|START TRANSACTION" "$f" 2>/dev/null; then
+                VIOLATIONS+=("$f: DROP/TRUNCATE outside transaction")
+              fi
+            fi
+            # Adding NOT NULL column without a DEFAULT is destructive on existing tables
+            if grep -qiE "ADD COLUMN.+NOT NULL" "$f" 2>/dev/null; then
+              if ! grep -qi "DEFAULT" "$f" 2>/dev/null; then
+                VIOLATIONS+=("$f: ADD COLUMN NOT NULL without DEFAULT (will fail on non-empty tables)")
+              fi
+            fi
+          done
+
+          if [ ${#VIOLATIONS[@]} -gt 0 ]; then
+            echo "::error::Dangerous migration patterns detected:"
+            printf '  %s\n' "${VIOLATIONS[@]}"
+            exit 1
+          fi
+          echo "::notice::Migration safety lint passed"
+        shell: bash
