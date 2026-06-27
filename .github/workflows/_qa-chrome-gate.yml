@@ -1,0 +1,237 @@
+name: QA Chrome Gate (reusable)
+# Reusable workflow. Call from any product repo to run Playwright Chromium tests,
+# log results to Supabase qa_chrome_runs, and skip if same SHA already passed.
+#
+# Required org secrets (set at intelligent-group level):
+#   QA_SUPABASE_URL, QA_SUPABASE_SERVICE_ROLE_KEY
+#
+# Optional per-repo secrets:
+#   CLERK_TEST_USER_EMAIL, CLERK_TEST_USER_PASSWORD, PLAYWRIGHT_BASE_URL
+#
+# Caller must pass secrets explicitly or use secrets: inherit, e.g.:
+#   uses: intelligent-group/.github/.github/workflows/_qa-chrome-gate.yml@main
+#   secrets:
+#     QA_SUPABASE_URL: ${{ secrets.QA_SUPABASE_URL }}
+#     QA_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.QA_SUPABASE_SERVICE_ROLE_KEY }}
+#     PLAYWRIGHT_BASE_URL: ${{ secrets.PLAYWRIGHT_BASE_URL }}
+#     CLERK_TEST_USER_EMAIL: ${{ secrets.CLERK_TEST_USER_EMAIL }}
+#     CLERK_TEST_USER_PASSWORD: ${{ secrets.CLERK_TEST_USER_PASSWORD }}
+# OR use `secrets: inherit` if calling from same org.
+
+on:
+  workflow_call:
+    inputs:
+      product:
+        description: 'Product slug (e.g. ait-trust-portal). Used as ledger key.'
+        required: true
+        type: string
+      product_url:
+        description: 'Deployed URL for PLAYWRIGHT_BASE_URL. Override with PLAYWRIGHT_BASE_URL secret.'
+        required: false
+        type: string
+        default: ''
+      playwright_command:
+        description: 'Command to run tests (default runs chromium project only).'
+        required: false
+        type: string
+        default: 'npx playwright test --project=chromium --reporter=json,html'
+      working_directory:
+        description: 'Working directory containing playwright.config.ts (default: repo root).'
+        required: false
+        type: string
+        default: '.'
+      node_version:
+        description: 'Node.js version.'
+        required: false
+        type: string
+        default: '20'
+      skip_if_same_sha:
+        description: 'Skip if this exact SHA already passed (default: true).'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      PLAYWRIGHT_BASE_URL:
+        required: false
+      CLERK_TEST_USER_EMAIL:
+        required: false
+      CLERK_TEST_USER_PASSWORD:
+        required: false
+      QA_SUPABASE_URL:
+        required: true
+      QA_SUPABASE_SERVICE_ROLE_KEY:
+        required: true
+    outputs:
+      status:
+        description: "'pass', 'fail', or 'skip'"
+        value: ${{ jobs.chrome-qa.outputs.status }}
+      tests_passed:
+        description: 'Count of passing tests'
+        value: ${{ jobs.chrome-qa.outputs.tests_passed }}
+      tests_failed:
+        description: 'Count of failing tests'
+        value: ${{ jobs.chrome-qa.outputs.tests_failed }}
+      artifact_name:
+        description: 'Name of the uploaded HTML report artifact'
+        value: ${{ jobs.chrome-qa.outputs.artifact_name }}
+
+jobs:
+  chrome-qa:
+    name: 'Chrome QA — ${{ inputs.product }}'
+    runs-on: [self-hosted, ig-self-hosted]
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    outputs:
+      status: ${{ steps.finalize.outputs.status }}
+      tests_passed: ${{ steps.parse.outputs.tests_passed }}
+      tests_failed: ${{ steps.parse.outputs.tests_failed }}
+      artifact_name: ${{ steps.upload.outputs.artifact-name }}
+    env:
+      PLAYWRIGHT_BASE_URL: ${{ secrets.PLAYWRIGHT_BASE_URL || inputs.product_url }}
+      CLERK_TEST_USER_EMAIL: ${{ secrets.CLERK_TEST_USER_EMAIL }}
+      CLERK_TEST_USER_PASSWORD: ${{ secrets.CLERK_TEST_USER_PASSWORD }}
+      CI: 'true'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip if SHA already passed
+        id: skip
+        if: inputs.skip_if_same_sha
+        env:
+          SUPA_URL: ${{ secrets.QA_SUPABASE_URL }}
+          SUPA_KEY: ${{ secrets.QA_SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          EXISTING=$(curl -sf \
+            "$SUPA_URL/rest/v1/qa_chrome_runs?product=eq.${{ inputs.product }}&sha=eq.${{ github.sha }}&status=eq.pass&limit=1&select=id" \
+            -H "apikey: $SUPA_KEY" \
+            -H "Authorization: Bearer $SUPA_KEY" 2>/dev/null | jq -r 'length' || echo 0)
+          if [ "$EXISTING" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Chrome QA skipped — SHA ${{ github.sha }} already passed for ${{ inputs.product }}"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.skip.outputs.skip != 'true'
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.skip.outputs.skip != 'true'
+        run: npm ci
+
+      - name: Install Playwright Chromium browser
+        if: steps.skip.outputs.skip != 'true'
+        run: npx playwright install chromium --with-deps
+
+      - name: Run Chrome tests
+        id: run
+        if: steps.skip.outputs.skip != 'true'
+        # PLAYWRIGHT_JSON_OUTPUT_NAME tells the json reporter where to write its file.
+        # Without this, the json reporter outputs to stdout only and test-results/results.json
+        # never exists, causing the parse step to silently record zeros in Supabase.
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_NAME: test-results/results.json
+        run: |
+          START_MS=$(date +%s%3N)
+          set +e
+          ${{ inputs.playwright_command }} \
+            --output=test-results \
+            2>&1 | tee /tmp/pw-stdout.txt
+          EXIT_CODE=$?
+          set -e
+          END_MS=$(date +%s%3N)
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          echo "duration_ms=$((END_MS - START_MS))" >> "$GITHUB_OUTPUT"
+          [ $EXIT_CODE -eq 0 ] && echo "raw_status=pass" >> "$GITHUB_OUTPUT" || echo "raw_status=fail" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Parse test results
+        id: parse
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          REPORT=""
+          # PLAYWRIGHT_JSON_OUTPUT_NAME writes here; --output=test-results for artifacts.
+          if [ -f test-results/results.json ]; then
+            REPORT=test-results/results.json
+          elif [ -f results.json ]; then
+            REPORT=results.json
+          fi
+
+          if [ -n "$REPORT" ]; then
+            PASSED=$(jq '.stats.expected // 0' "$REPORT" 2>/dev/null || echo 0)
+            FAILED=$(jq '(.stats.unexpected // 0) + (.stats.flaky // 0)' "$REPORT" 2>/dev/null || echo 0)
+            TOTAL=$(jq '.stats.total // 0' "$REPORT" 2>/dev/null || echo 0)
+          else
+            PASSED=0; FAILED=0; TOTAL=0
+          fi
+          echo "tests_passed=$PASSED" >> "$GITHUB_OUTPUT"
+          echo "tests_failed=$FAILED" >> "$GITHUB_OUTPUT"
+          echo "tests_total=$TOTAL" >> "$GITHUB_OUTPUT"
+          # Capture first error line for summary
+          ERROR=$(grep -m1 'Error\|failed\|✘' /tmp/pw-stdout.txt 2>/dev/null | head -c 200 || echo '')
+          echo "error_summary<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$ERROR" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Upload HTML report
+        id: upload
+        if: steps.skip.outputs.skip != 'true' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chrome-qa-report-${{ inputs.product }}-${{ github.run_id }}
+          path: ${{ inputs.working_directory }}/playwright-report/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Log result to Supabase
+        id: log
+        if: steps.skip.outputs.skip != 'true' && always()
+        env:
+          SUPA_URL: ${{ secrets.QA_SUPABASE_URL }}
+          SUPA_KEY: ${{ secrets.QA_SUPABASE_SERVICE_ROLE_KEY }}
+          STATUS: ${{ steps.run.outputs.raw_status || 'fail' }}
+          DURATION: ${{ steps.run.outputs.duration_ms || 0 }}
+          PASSED: ${{ steps.parse.outputs.tests_passed || 0 }}
+          FAILED: ${{ steps.parse.outputs.tests_failed || 0 }}
+          TOTAL: ${{ steps.parse.outputs.tests_total || 0 }}
+          ERROR: ${{ steps.parse.outputs.error_summary || '' }}
+          TRIGGER: ${{ github.event_name == 'schedule' && 'nightly' || 'pr' }}
+          PR_NUM: ${{ github.event.pull_request.number || '' }}
+          URL_TESTED: ${{ env.PLAYWRIGHT_BASE_URL || inputs.product_url }}
+        run: |
+          curl -sf -X POST "$SUPA_URL/rest/v1/qa_chrome_runs" \
+            -H "apikey: $SUPA_KEY" \
+            -H "Authorization: Bearer $SUPA_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: return=minimal" \
+            -d "{
+              \"product\": \"${{ inputs.product }}\",
+              \"trigger\": \"$TRIGGER\",
+              \"sha\": \"${{ github.sha }}\",
+              \"pr_number\": \"$PR_NUM\",
+              \"status\": \"$STATUS\",
+              \"tests_total\": $TOTAL,
+              \"tests_passed\": $PASSED,
+              \"tests_failed\": $FAILED,
+              \"url_tested\": \"$URL_TESTED\",
+              \"duration_ms\": $DURATION,
+              \"error_summary\": $(echo -n "$ERROR" | jq -Rs .)
+            }" || echo "Warning: failed to log to Supabase (non-blocking)"
+
+      - name: Finalize status
+        id: finalize
+        if: always()
+        run: |
+          if [ "${{ steps.skip.outputs.skip }}" = "true" ]; then
+            echo "status=skip" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.run.outputs.raw_status }}" = "pass" ]; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
