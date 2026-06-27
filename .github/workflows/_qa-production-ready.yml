@@ -1,0 +1,137 @@
+name: Production Ready Gate (reusable)
+# Fires when Chrome QA passes on a PR. Checks if ALL required status checks for
+# the PR's HEAD SHA have passed. If so, comments "production ready" and labels the PR.
+#
+# IMPORTANT — github.sha in workflow_run context is the merge/default-branch SHA, not
+# the PR head. When triggering from workflow_run, pass the PR head SHA as an input
+# (github.event.workflow_run.head_sha) rather than relying on github.sha.
+#
+# Usage: call from per-product qa-production-ready-caller.yml using workflow_run trigger.
+# Example:
+#   on:
+#     workflow_run:
+#       workflows: ['QA Chrome Gate (reusable)']
+#       types: [completed]
+#   jobs:
+#     call-production-ready:
+#       if: ${{ github.event.workflow_run.conclusion == 'success' }}
+#       uses: intelligent-group/.github/.github/workflows/_qa-production-ready.yml@main
+#       with:
+#         product: my-product
+#         head_sha: ${{ github.event.workflow_run.head_sha }}
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      product:
+        required: true
+        type: string
+      required_check_names:
+        description: 'Comma-separated list of required check names that must all pass.'
+        required: false
+        type: string
+        default: ''
+      head_sha:
+        description: >
+          PR head SHA to evaluate. When called from workflow_run, pass
+          github.event.workflow_run.head_sha. Defaults to github.sha (correct
+          for direct pull_request triggers, wrong for workflow_run).
+        required: false
+        type: string
+        default: ''
+    secrets:
+      GH_PR_TOKEN:
+        required: false
+
+jobs:
+  mark-production-ready:
+    name: 'Production Ready — ${{ inputs.product }}'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+      statuses: read
+      checks: read
+    steps:
+      - name: Resolve SHA
+        id: sha
+        run: |
+          # Use explicit head_sha if provided (workflow_run callers must supply this),
+          # otherwise fall back to github.sha (direct pull_request triggers).
+          SHA="${{ inputs.head_sha }}"
+          if [ -z "$SHA" ]; then
+            SHA="${{ github.sha }}"
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Resolved SHA: $SHA"
+
+      - name: Find PR for SHA
+        id: find-pr
+        env:
+          GH_TOKEN: ${{ secrets.GH_PR_TOKEN || github.token }}
+        run: |
+          SHA="${{ steps.sha.outputs.sha }}"
+          REPO="${{ github.repository }}"
+          # Find open PR with this SHA as head
+          PR_NUM=$(gh api "repos/$REPO/commits/$SHA/pulls" --jq '.[0].number // empty' 2>/dev/null || echo '')
+          echo "pr_number=$PR_NUM" >> "$GITHUB_OUTPUT"
+          echo "PR for SHA $SHA: $PR_NUM"
+
+      - name: Check all required gates passed
+        id: gates
+        if: steps.find-pr.outputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_PR_TOKEN || github.token }}
+        run: |
+          REPO="${{ github.repository }}"
+          SHA="${{ steps.sha.outputs.sha }}"
+          # Get all check runs for this SHA
+          CHECKS=$(gh api "repos/$REPO/commits/$SHA/check-runs" --paginate --jq '[.check_runs[] | {name: .name, conclusion: .conclusion}]')
+          FAILED=$(echo "$CHECKS" | jq '[.[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled")] | length')
+          PENDING=$(echo "$CHECKS" | jq '[.[] | select(.conclusion == null)] | length')
+          echo "Failed: $FAILED, Pending: $PENDING"
+          if [ "$FAILED" -gt 0 ]; then
+            echo "all_green=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Some checks failed" >> "$GITHUB_OUTPUT"
+          elif [ "$PENDING" -gt 0 ]; then
+            echo "all_green=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Some checks still pending" >> "$GITHUB_OUTPUT"
+          else
+            echo "all_green=true" >> "$GITHUB_OUTPUT"
+            echo "reason=All checks passed" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment production-ready on PR
+        if: steps.find-pr.outputs.pr_number != '' && steps.gates.outputs.all_green == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PR_TOKEN || github.token }}
+          PR: ${{ steps.find-pr.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+          PRODUCT: ${{ inputs.product }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          BODY="## Production Ready — \`$PRODUCT\`
+
+All QA gates passed for this commit. This PR is cleared for human review and merge to production.
+
+| Gate | Status |
+|------|--------|
+| Build + TypeScript | Passed |
+| Gitleaks secret scan | Passed |
+| Auth invariant smoke | Passed |
+| Chrome click-through QA | Passed |
+
+**Commit:** \`$SHA\`
+**Run:** [View QA report]($RUN_URL)
+
+*Auto-generated by IG QA Chrome Gate · $(date -u '+%Y-%m-%d %H:%M UTC')*"
+
+          gh pr comment "$PR" --repo "$REPO" --body "$BODY"
+
+          # Create label if missing, then apply
+          gh label create "production-ready" --repo "$REPO" \
+            --color "0e8a16" --description "All QA gates passed — ready for human review" 2>/dev/null || true
+          gh pr edit "$PR" --repo "$REPO" --add-label "production-ready"
+          echo "Marked PR #$PR as production-ready"
