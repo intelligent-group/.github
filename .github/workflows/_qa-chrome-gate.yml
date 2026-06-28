@@ -121,7 +121,8 @@ jobs:
 
       - name: Configure git HTTPS (avoids SSH for private github: deps)
         if: steps.skip.outputs.skip != 'true'
-        run: git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "git@github.com:"
+        run: |
+          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "git@github.com:"
 
       - name: Install dependencies
         if: steps.skip.outputs.skip != 'true'
