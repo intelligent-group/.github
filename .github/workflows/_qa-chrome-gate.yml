@@ -61,6 +61,8 @@ on:
         required: true
       QA_SUPABASE_SERVICE_ROLE_KEY:
         required: true
+      IG_PACKAGES_TOKEN:
+        required: false
     outputs:
       status:
         description: "'pass', 'fail', or 'skip'"
@@ -122,8 +124,9 @@ jobs:
       - name: Configure git HTTPS for private github deps
         if: steps.skip.outputs.skip != 'true'
         run: |
-          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "git@github.com:"
-          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "ssh://git@github.com/"
+          TOKEN="${{ secrets.IG_PACKAGES_TOKEN || github.token }}"
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "git@github.com:"
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
 
       - name: Install dependencies
         if: steps.skip.outputs.skip != 'true'
