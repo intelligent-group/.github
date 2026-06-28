@@ -104,7 +104,11 @@ jobs:
       # ---------------------------------------------------------------------------
       - id: mint-runner-token
         name: Mint GitHub App runner-query token
-        if: ${{ secrets.app_id != '' && secrets.app_private_key != '' }}
+        # `secrets` context is NOT allowed in step `if:` conditions (GHA + actionlint).
+        # Use continue-on-error instead: the step fails softly when APP_ID is not set
+        # (create-github-app-token requires a valid app-id), and the three-tier token
+        # fallback in the `decide` step picks up runner_query_pat or GITHUB_TOKEN.
+        continue-on-error: true
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.app_id }}
