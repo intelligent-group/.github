@@ -118,11 +118,16 @@ jobs:
         if: steps.skip.outputs.skip != 'true'
         with:
           node-version: ${{ inputs.node_version }}
-          cache: npm
 
       - name: Install dependencies
         if: steps.skip.outputs.skip != 'true'
-        run: npm ci
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            npm install -g pnpm@latest --quiet
+            pnpm install --frozen-lockfile
+          else
+            npm ci
+          fi
 
       - name: Install Playwright Chromium browser
         if: steps.skip.outputs.skip != 'true'
