@@ -48,20 +48,10 @@ jobs:
   mark-production-ready:
     name: 'Production Ready — ${{ inputs.product }}'
     runs-on: ubuntu-latest
-    # Minimal permissions for the GITHUB_TOKEN so the three API calls below succeed.
-    # Added at job level (not workflow level) — workflow-level permissions: causes
-    # startup_failure in this org's GHA config (see _pick-runner.yml comment).
-    #   pull-requests: write — list PRs for a commit · add comment · add label
-    #   checks: read         — list check-runs for the SHA
-    #   contents: read       — standard safe default
-    #   issues: write        — create/manage labels (GitHub labels API uses issues scope)
-    # No App token needed: these are standard endpoints GITHUB_TOKEN can reach with
-    # the correct permissions block (unlike administration:read which it structurally cannot).
-    permissions:
-      pull-requests: write
-      checks: read
-      contents: read
-      issues: write
+    # Permissions are inherited from the caller (qa-chrome-caller.yml sets
+    # pull-requests:write, checks:read, contents:read at workflow level).
+    # Job-level permissions: in workflow_call reusables causes startup_failure
+    # in this org — do not add them here. See feedback_gha_reusable_workflow_permissions.
     steps:
       - name: Resolve SHA
         id: sha
@@ -144,3 +134,4 @@ jobs:
             --color "0e8a16" --description "All QA gates passed — ready for human review" 2>/dev/null || true
           gh pr edit "$PR" --repo "$REPO" --add-label "production-ready"
           echo "Marked PR #$PR as production-ready"
+
