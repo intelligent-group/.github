@@ -1,0 +1,10 @@
+# actionlint configuration for intelligent-group/.github
+# https://github.com/rhysd/actionlint/blob/main/docs/config.md
+
+self-hosted-runner:
+  # Custom self-hosted runner labels used in IG reusable workflows.
+  # ig-self-hosted = MIG (GPU-enabled cloud runner, ~$0.01/job amortized)
+  # pc-cpu         = on-premises PC runner (always preferred when online)
+  labels:
+    - ig-self-hosted
+    - pc-cpu
