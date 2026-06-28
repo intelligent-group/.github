@@ -1,0 +1,37 @@
+name: actionlint
+
+# Lint all reusable workflows in this repo on every PR and push.
+# Catches: secrets-context-in-if, undefined-secrets, shellcheck on run blocks.
+# A broken reusable workflow silently breaks every caller fleet-wide — this gate
+# prevents fleet-wide P0s like the `secrets` in step `if:` incident (2026-06-28).
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: actionlint — reusable workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run actionlint
+        uses: raven-actions/actionlint@v2
+        with:
+          # Lint .yml/.yaml workflow files only — excludes scripts/ subdirectory.
+          # shellcheck is enabled by default in raven-actions/actionlint@v2 and
+          # analyzes inline `run:` bash blocks for shell mistakes.
+          # fail-on-error defaults to true — any actionlint error fails this job.
+          files: ".github/workflows/*.yml,.github/workflows/*.yaml"
