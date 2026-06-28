@@ -77,7 +77,7 @@ on:
 
 jobs:
   chrome-qa:
-    name: 'Chrome QA — ${{ inputs.product }}'
+    name: 'Chrome QA â€” ${{ inputs.product }}'
     runs-on: [self-hosted, ig-self-hosted]
     defaults:
       run:
@@ -109,7 +109,7 @@ jobs:
             -H "Authorization: Bearer $SUPA_KEY" 2>/dev/null | jq -r 'length' || echo 0)
           if [ "$EXISTING" -gt 0 ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::Chrome QA skipped — SHA ${{ github.sha }} already passed for ${{ inputs.product }}"
+            echo "::notice::Chrome QA skipped â€” SHA ${{ github.sha }} already passed for ${{ inputs.product }}"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
@@ -123,6 +123,7 @@ jobs:
         if: steps.skip.outputs.skip != 'true'
         run: |
           git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "git@github.com:"
+          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "ssh://git@github.com/"
 
       - name: Install dependencies
         if: steps.skip.outputs.skip != 'true'
@@ -187,7 +188,7 @@ jobs:
             echo "tests_total=$TOTAL"
           } >> "$GITHUB_OUTPUT"
           # Capture first error line for summary
-          ERROR=$(grep -m1 'Error\|failed\|✘' /tmp/pw-stdout.txt 2>/dev/null | head -c 200 || echo '')
+          ERROR=$(grep -m1 'Error\|failed\|âœ˜' /tmp/pw-stdout.txt 2>/dev/null | head -c 200 || echo '')
           {
             echo "error_summary<<EOF"
             echo "$ERROR"
