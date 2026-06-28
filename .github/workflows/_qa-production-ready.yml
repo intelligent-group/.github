@@ -44,15 +44,16 @@ on:
       GH_PR_TOKEN:
         required: false
 
+permissions:
+  pull-requests: write
+  issues: write
+  statuses: read
+  checks: read
+
 jobs:
   mark-production-ready:
     name: 'Production Ready — ${{ inputs.product }}'
     runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write
-      issues: write
-      statuses: read
-      checks: read
     steps:
       - name: Resolve SHA
         id: sha
