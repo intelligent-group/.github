@@ -48,6 +48,20 @@ jobs:
   mark-production-ready:
     name: 'Production Ready — ${{ inputs.product }}'
     runs-on: ubuntu-latest
+    # Minimal permissions for the GITHUB_TOKEN so the three API calls below succeed.
+    # Added at job level (not workflow level) — workflow-level permissions: causes
+    # startup_failure in this org's GHA config (see _pick-runner.yml comment).
+    #   pull-requests: write — list PRs for a commit · add comment · add label
+    #   checks: read         — list check-runs for the SHA
+    #   contents: read       — standard safe default
+    #   issues: write        — create/manage labels (GitHub labels API uses issues scope)
+    # No App token needed: these are standard endpoints GITHUB_TOKEN can reach with
+    # the correct permissions block (unlike administration:read which it structurally cannot).
+    permissions:
+      pull-requests: write
+      checks: read
+      contents: read
+      issues: write
     steps:
       - name: Resolve SHA
         id: sha
