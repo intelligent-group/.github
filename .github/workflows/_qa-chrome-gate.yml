@@ -131,7 +131,9 @@ jobs:
 
       - name: Install Playwright Chromium browser
         if: steps.skip.outputs.skip != 'true'
-        run: npx playwright install chromium --with-deps
+        run: |
+          npx playwright install chromium --with-deps 2>/dev/null \
+            || npx playwright install chromium
 
       - name: Run Chrome tests
         id: run
