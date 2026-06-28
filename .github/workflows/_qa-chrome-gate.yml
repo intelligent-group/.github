@@ -119,7 +119,7 @@ jobs:
         with:
           node-version: ${{ inputs.node_version }}
 
-      - name: Configure git HTTPS (avoids SSH for private github: deps)
+      - name: Configure git HTTPS for private github deps
         if: steps.skip.outputs.skip != 'true'
         run: |
           git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "git@github.com:"
