@@ -22,27 +22,37 @@ name: Pick runner
 # /orgs/{org}/actions/runners — the endpoint requires `administration:read`
 # which is NOT in the GITHUB_TOKEN permission set. Even with `permissions: actions: read`
 # on the consumer, the reusable receives a heavily-restricted integration token (403
-# on GET /user). Fix: pass a PAT via secrets.RUNNER_QUERY_PAT (stored in repo secrets).
-# The reusable accepts it via `secrets: runner_query_pat`. Consumers call with:
-#   secrets:
-#     runner_query_pat: ${{ secrets.RUNNER_QUERY_PAT }}
-# GSM canonical name: github__mroot2025__runner-query-pat (project: intelligent-group-ait).
+# on GET /user).
 #
-# Consumer pattern (non-HIPAA):
+# AUTH HIERARCHY (preferred → fallback):
+#   1. GitHub App installation token (zero-rotation) — activated when org secrets
+#      APP_ID + APP_PRIVATE_KEY are set AND the caller uses `secrets: inherit`.
+#      Required App permission: organization_self_hosted_runners (read).
+#      Minted fresh per-run via actions/create-github-app-token@v3.
+#   2. RUNNER_QUERY_PAT (static PAT) — legacy fallback while App is not wired.
+#      GSM canonical name: github__mroot2025__runner-query-pat (project: intelligent-group-ait).
+#   3. GITHUB_TOKEN — structural fallback; always produces empty runner list
+#      (administration:read not in scope), so all jobs land on ubuntu-latest.
+#
+# Consumer pattern (preferred — passes all org secrets including APP_ID/APP_PRIVATE_KEY):
 #
 #   jobs:
 #     pick:
 #       uses: intelligent-group/.github/.github/workflows/_pick-runner.yml@main
 #       with:
-#         weight: heavy   # "light" for lint/typecheck/format; "heavy" for build/test/e2e. Default: heavy (safer).
-#       secrets:
-#         runner_query_pat: ${{ secrets.RUNNER_QUERY_PAT }}
+#         weight: heavy   # "light" for lint/typecheck/format; "heavy" for build/test/e2e.
+#       secrets: inherit  # passes APP_ID + APP_PRIVATE_KEY + RUNNER_QUERY_PAT
 #     build:
 #       needs: pick
 #       runs-on: ${{ fromJSON(needs.pick.outputs.runs_on) }}
 #       steps:
 #         - uses: actions/checkout@v4
 #         - run: pnpm install && pnpm test
+#
+# Legacy consumer pattern (PAT only — still works, App token not activated):
+#
+#   secrets:
+#     runner_query_pat: ${{ secrets.RUNNER_QUERY_PAT }}
 #
 # Costs ~5s of ubuntu-latest per consuming workflow run (the pick job itself).
 
@@ -56,7 +66,13 @@ on:
         default: heavy
     secrets:
       runner_query_pat:
-        description: "PAT with administration:read on this org. GITHUB_TOKEN cannot query the runners API (requires administration:read, not in token permission set). Store in repo secrets as RUNNER_QUERY_PAT."
+        description: "PAT with administration:read on this org (legacy fallback). Still works when APP_ID is not configured. Store as org/repo secret RUNNER_QUERY_PAT."
+        required: false
+      app_id:
+        description: "GitHub App ID (integer) for intelligent-group-ait-bot. When set together with app_private_key, a short-lived installation token is minted instead of using the static RUNNER_QUERY_PAT. Activate by adding APP_ID as an org secret and using `secrets: inherit` in callers."
+        required: false
+      app_private_key:
+        description: "GitHub App private key PEM for app_id. Store as org secret APP_PRIVATE_KEY."
         required: false
     outputs:
       runs_on:
@@ -69,7 +85,7 @@ on:
 # NOTE: do NOT add workflow-level permissions: block here. Prior bisect proved
 # that workflow-level permissions: causes startup_failure in this org's GHA config.
 # Root cause is deeper: GITHUB_TOKEN structurally cannot call the runners API.
-# Solution is a PAT passed via secrets.runner_query_pat (see comment above).
+# Solution: App installation token (preferred) or PAT (legacy) — see AUTH HIERARCHY above.
 
 jobs:
   pick:
@@ -79,12 +95,28 @@ jobs:
       runs_on: ${{ steps.decide.outputs.runs_on }}
       picked:  ${{ steps.decide.outputs.picked }}
     steps:
+      # ---------------------------------------------------------------------------
+      # Mint a short-lived GitHub App installation token (zero-rotation path).
+      # Only runs when APP_ID + APP_PRIVATE_KEY are available (org secrets passed
+      # via `secrets: inherit` in the calling workflow).
+      # Required App permission: organization_self_hosted_runners (read).
+      # When skipped, decide step falls back to runner_query_pat (legacy PAT).
+      # ---------------------------------------------------------------------------
+      - id: mint-runner-token
+        name: Mint GitHub App runner-query token
+        if: ${{ secrets.app_id != '' && secrets.app_private_key != '' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.app_id }}
+          private-key: ${{ secrets.app_private_key }}
+          owner: ${{ github.repository_owner }}
+
       - id: decide
         env:
-          # Use PAT if provided (needed for administration:read on runners API).
-          # Falls back to GITHUB_TOKEN which will always produce empty runner list,
-          # causing all jobs to land on ubuntu-latest.
-          GH_TOKEN: ${{ secrets.runner_query_pat || secrets.GITHUB_TOKEN }}
+          # Token priority: App installation token → legacy PAT → GITHUB_TOKEN (403 fallback).
+          # App token is used when APP_ID + APP_PRIVATE_KEY are set (zero-rotation).
+          # RUNNER_QUERY_PAT remains fully functional as fallback during migration.
+          GH_TOKEN: ${{ steps.mint-runner-token.outputs.token || secrets.runner_query_pat || secrets.GITHUB_TOKEN }}
           WEIGHT:   ${{ inputs.weight }}
         shell: bash
         run: |
