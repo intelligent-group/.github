@@ -86,7 +86,7 @@ jobs:
       status: ${{ steps.finalize.outputs.status }}
       tests_passed: ${{ steps.parse.outputs.tests_passed }}
       tests_failed: ${{ steps.parse.outputs.tests_failed }}
-      artifact_name: ${{ steps.upload.outputs.artifact-name }}
+      artifact_name: "chrome-qa-report-${{ inputs.product }}-${{ github.run_id }}"
     env:
       PLAYWRIGHT_BASE_URL: ${{ secrets.PLAYWRIGHT_BASE_URL || inputs.product_url }}
       CLERK_TEST_USER_EMAIL: ${{ secrets.CLERK_TEST_USER_EMAIL }}
@@ -176,14 +176,18 @@ jobs:
           else
             PASSED=0; FAILED=0; TOTAL=0
           fi
-          echo "tests_passed=$PASSED" >> "$GITHUB_OUTPUT"
-          echo "tests_failed=$FAILED" >> "$GITHUB_OUTPUT"
-          echo "tests_total=$TOTAL" >> "$GITHUB_OUTPUT"
+          {
+            echo "tests_passed=$PASSED"
+            echo "tests_failed=$FAILED"
+            echo "tests_total=$TOTAL"
+          } >> "$GITHUB_OUTPUT"
           # Capture first error line for summary
           ERROR=$(grep -m1 'Error\|failed\|✘' /tmp/pw-stdout.txt 2>/dev/null | head -c 200 || echo '')
-          echo "error_summary<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$ERROR" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          {
+            echo "error_summary<<EOF"
+            echo "$ERROR"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Upload HTML report
         id: upload
