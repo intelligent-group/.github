@@ -79,7 +79,7 @@ on:
 
 jobs:
   chrome-qa:
-    name: 'Chrome QA â€” ${{ inputs.product }}'
+    name: 'Chrome QA - ${{ inputs.product }}'
     runs-on: [self-hosted, ig-self-hosted]
     defaults:
       run:
@@ -111,7 +111,7 @@ jobs:
             -H "Authorization: Bearer $SUPA_KEY" 2>/dev/null | jq -r 'length' || echo 0)
           if [ "$EXISTING" -gt 0 ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::Chrome QA skipped â€” SHA ${{ github.sha }} already passed for ${{ inputs.product }}"
+            echo "::notice::Chrome QA skipped - SHA ${{ github.sha }} already passed for ${{ inputs.product }}"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
