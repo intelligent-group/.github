@@ -85,10 +85,23 @@ jobs:
         run: |
           REPO="${{ github.repository }}"
           SHA="${{ steps.sha.outputs.sha }}"
-          # Get all check runs for this SHA
-          CHECKS=$(gh api "repos/$REPO/commits/$SHA/check-runs" --paginate --jq '[.check_runs[] | {name: .name, conclusion: .conclusion}]')
-          FAILED=$(echo "$CHECKS" | jq '[.[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled")] | length')
-          PENDING=$(echo "$CHECKS" | jq '[.[] | select(.conclusion == null)] | length')
+          # Get all check runs for this SHA, including started_at so we can keep only
+          # the latest run per check name.
+          CHECKS=$(gh api "repos/$REPO/commits/$SHA/check-runs" --paginate --jq '[.check_runs[] | {name: .name, conclusion: .conclusion, started_at: .started_at}]')
+          # Reduce to the latest run per check name (drops superseded/re-run duplicates)
+          # and EXCLUDE this Production Ready check itself — its own run is a check-run on
+          # the same SHA, so counting it makes the gate self-perpetuatingly red after any
+          # re-run (the prior failed Production Ready run is read as a "failure" forever).
+          LATEST=$(echo "$CHECKS" | jq '
+            group_by(.name)
+            | map(sort_by(.started_at) | last)
+            | map(select(.name | test("Production Ready") | not))
+          ')
+          # Only genuine failures block. "cancelled" comes from workflow supersession /
+          # concurrency cancellation, not a real gate failure, so treat it as pending
+          # ("needs re-run") rather than failed.
+          FAILED=$(echo "$LATEST" | jq '[.[] | select(.conclusion == "failure" or .conclusion == "timed_out")] | length')
+          PENDING=$(echo "$LATEST" | jq '[.[] | select(.conclusion == null or .conclusion == "cancelled")] | length')
           echo "Failed: $FAILED, Pending: $PENDING"
           if [ "$FAILED" -gt 0 ]; then
             echo "all_green=false" >> "$GITHUB_OUTPUT"
