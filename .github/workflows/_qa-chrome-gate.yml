@@ -96,6 +96,22 @@ jobs:
       CI: 'true'
 
     steps:
+      - name: Reset persistent-runner git auth (pre-checkout)
+        # Self-hosted runners are persistent: a prior run's --global
+        # http.<github>.extraheader survives on the box. actions/checkout then adds
+        # its own --local one, and checkout's OWN git fetch sends BOTH -> github
+        # rejects with `Duplicate header: "Authorization"` (HTTP 400), failing
+        # checkout itself -- before the Configure-git step (which is gated by the
+        # SHA-skip check) ever runs. Clear the global auth/rewrite state first so
+        # checkout starts from a clean slate. Run at the workspace root: the job's
+        # default working-directory may be a subdir that does not exist until
+        # checkout, and git config --global does not need a repo.
+        working-directory: ${{ github.workspace }}
+        run: |
+          git config --global --unset-all http."https://github.com/".extraheader 2>/dev/null || true
+          git config --global --name-only --get-regexp '^url\..*github\.com.*\.insteadof$' 2>/dev/null \
+            | while read -r key; do git config --global --unset-all "$key" 2>/dev/null || true; done
+
       - uses: actions/checkout@v4
 
       - name: Skip if SHA already passed
