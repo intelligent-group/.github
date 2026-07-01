@@ -137,8 +137,14 @@ jobs:
           # 1. Purge stale token-embedded insteadOf rules for github.com.
           git config --global --name-only --get-regexp '^url\..*github\.com.*\.insteadof$' 2>/dev/null \
             | while read -r key; do git config --global --unset-all "$key" 2>/dev/null || true; done
-          # 2. Purge any prior github.com auth header (ours or actions/checkout's).
+          # 2. Purge any prior github.com auth header at EVERY scope. actions/checkout
+          #    sets its own --local extraheader (with the repo-scoped github.token); if
+          #    ours (--global) coexists, npm's git op sends BOTH and github rejects the
+          #    request with `Duplicate header: "Authorization"` (HTTP 400). Clear all
+          #    scopes so exactly one extraheader (ours, below) remains.
+          git config --system --unset-all http."https://github.com/".extraheader 2>/dev/null || true
           git config --global --unset-all http."https://github.com/".extraheader 2>/dev/null || true
+          git config --local  --unset-all http."https://github.com/".extraheader 2>/dev/null || true
           # 3. Token-agnostic rewrite: npm's `github:` shorthand resolves to git+ssh,
           #    so rewrite the ssh/scp forms to plain https (no token in URL or key).
           git config --global url."https://github.com/".insteadOf "git@github.com:"
