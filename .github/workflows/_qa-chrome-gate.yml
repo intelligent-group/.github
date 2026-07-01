@@ -96,6 +96,11 @@ jobs:
       CI: 'true'
 
     steps:
+      - name: Purge stale git auth headers (persistent runner hygiene)
+        run: |
+          git config --global --unset-all http."https://github.com/".extraheader 2>/dev/null || true
+          git config --system --unset-all http."https://github.com/".extraheader 2>/dev/null || true
+
       - uses: actions/checkout@v4
 
       - name: Skip if SHA already passed
