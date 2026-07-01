@@ -125,8 +125,28 @@ jobs:
         if: steps.skip.outputs.skip != 'true'
         run: |
           TOKEN="${{ secrets.IG_PACKAGES_TOKEN || github.token }}"
-          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "git@github.com:"
-          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
+          # Self-hosted runners are PERSISTENT, so --global git config survives across
+          # jobs. The previous approach embedded the token IN the rewrite URL
+          # (url."https://x-access-token:$TOKEN@github.com/".insteadOf ...), which makes
+          # the config KEY differ per token -- stale rules from prior runs (with an old
+          # or repo-scoped token) accumulate in ~/.gitconfig and can shadow the correct
+          # one, so a valid IG_PACKAGES_TOKEN still 404s ("Repository not found") on a
+          # private sibling dep. Fix: purge any prior github.com rewrites/auth, then use
+          # a token-AGNOSTIC insteadOf + http.extraheader (the actions/checkout pattern)
+          # whose config keys never embed the token.
+          # 1. Purge stale token-embedded insteadOf rules for github.com.
+          git config --global --name-only --get-regexp '^url\..*github\.com.*\.insteadof$' 2>/dev/null \
+            | while read -r key; do git config --global --unset-all "$key" 2>/dev/null || true; done
+          # 2. Purge any prior github.com auth header (ours or actions/checkout's).
+          git config --global --unset-all http."https://github.com/".extraheader 2>/dev/null || true
+          # 3. Token-agnostic rewrite: npm's `github:` shorthand resolves to git+ssh,
+          #    so rewrite the ssh/scp forms to plain https (no token in URL or key).
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          # 4. Auth via extraheader -- key is constant regardless of token value.
+          AUTH=$(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::${AUTH}"
+          git config --global http."https://github.com/".extraheader "AUTHORIZATION: basic ${AUTH}"
 
       - name: Install dependencies
         if: steps.skip.outputs.skip != 'true'
