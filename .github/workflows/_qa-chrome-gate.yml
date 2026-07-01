@@ -139,10 +139,46 @@ jobs:
           fi
 
       - name: Install Playwright Chromium browser
+        # The self-hosted runner pool is mixed-OS (some hosts on Ubuntu 24.04,
+        # at least one on 26.04). A repo's pinned @playwright/test version may
+        # not yet recognize a newer Ubuntu codename, which makes the browser
+        # install fail with "Playwright does not support chromium on
+        # ubuntuNN.NN-x64" even though the prebuilt Chromium binary itself is
+        # ABI-compatible. PLAYWRIGHT_HOST_PLATFORM_OVERRIDE is an official
+        # Playwright escape hatch that only changes which OS-tagged download
+        # path is used to fetch the SAME pinned Chromium revision - it does
+        # NOT change the browser/test-runner version, so there is no
+        # version-mismatch risk. We only engage it as a retry, after a normal
+        # install attempt fails with that specific error, so runners already
+        # on a recognized OS are unaffected.
         if: steps.skip.outputs.skip != 'true'
         run: |
-          npx playwright install chromium --with-deps 2>/dev/null \
-            || npx playwright install chromium
+          set +e
+          INSTALL_OUTPUT=$(npx playwright install chromium --with-deps 2>&1)
+          INSTALL_EXIT=$?
+          echo "$INSTALL_OUTPUT"
+          if [ $INSTALL_EXIT -ne 0 ]; then
+            INSTALL_OUTPUT=$(npx playwright install chromium 2>&1)
+            INSTALL_EXIT=$?
+            echo "$INSTALL_OUTPUT"
+          fi
+          if [ $INSTALL_EXIT -ne 0 ] && echo "$INSTALL_OUTPUT" | grep -q "does not support chromium on"; then
+            ARCH_SUFFIX="x64"
+            case "$(uname -m)" in
+              aarch64|arm64) ARCH_SUFFIX="arm64" ;;
+            esac
+            FALLBACK_PLATFORM="ubuntu24.04-${ARCH_SUFFIX}"
+            echo "::warning::Pinned Playwright build does not recognize this host OS. Retrying install with PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=${FALLBACK_PLATFORM} (same Chromium revision, different download path)."
+            export PLAYWRIGHT_HOST_PLATFORM_OVERRIDE="${FALLBACK_PLATFORM}"
+            npx playwright install chromium --with-deps 2>/dev/null
+            INSTALL_EXIT=$?
+            if [ $INSTALL_EXIT -ne 0 ]; then
+              npx playwright install chromium
+              INSTALL_EXIT=$?
+            fi
+          fi
+          set -e
+          exit $INSTALL_EXIT
 
       - name: Run Chrome tests
         id: run
