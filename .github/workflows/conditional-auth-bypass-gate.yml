@@ -1,0 +1,116 @@
+name: conditional-auth-bypass-gate
+
+# Rejects code that gates Clerk auth on env-var presence and falls back to
+# HTTP header reads. This pattern collapses to zero-auth when env vars are
+# absent (e.g. after a --set-env-vars wipe) — CVSS 9.1 class.
+#
+# Originating incident: ait-darkweb-monitor PR #503 (JWT audit 2026-07-01)
+#
+# Bad pattern:
+#   if (process.env.CLERK_SECRET_KEY) {
+#     const { orgId } = auth()
+#   } else {
+#     const orgId = req.headers.get('x-tenant-id')  // ZERO-AUTH
+#   }
+#
+# Fix: unconditional auth(). Misconfigured env = 500, not zero-auth:
+#   const { orgId } = auth()
+#   if (!orgId) return Response.json({ error: 'Unauthorized' }, { status: 401 })
+#
+# Reusable — call from any IG product repo with:
+#   uses: intelligent-group/.github/.github/workflows/conditional-auth-bypass-gate.yml@main
+
+on:
+  workflow_call: {}
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate-e-conditional-auth-bypass:
+    name: "Gate E — env-var-conditional auth bypass"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Step 1: Python AST-aware scan ─────────────────────────────────────
+      # Detects if-blocks that gate on CLERK_*KEY env vars AND contain a
+      # header fallback within ~20 lines — the exact zero-auth pattern.
+      - name: Scan for env-var-conditional auth bypass (deep)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Collect TS/TSX/JS files, excluding generated/vendored dirs
+          mapfile -t FILES < <(
+            find . -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" \) \
+              -not -path "*/node_modules/*" \
+              -not -path "*/.git/*" \
+              -not -path "*/dist/*" \
+              -not -path "*/.next/*" \
+              -not -path "*/build/*" \
+              -not -path "*/coverage/*" \
+              2>/dev/null
+          )
+
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "No TS/JS files found — skipping."
+            exit 0
+          fi
+
+          echo "Scanning ${#FILES[@]} file(s)..."
+          python3 .github/workflows/scripts/check-conditional-auth-bypass.py "${FILES[@]}"
+
+      # ── Step 2: Fast grep for hardcoded demo-org fallback strings ─────────
+      # Catches literals like "org-demo-intelligent-group" or "tenant-a" used
+      # as auth fallback values — found in the same darkweb-monitor audit.
+      # Emits a warning (not a failure) so it surfaces without blocking green PRs
+      # that only need a human review note.
+      - name: Grep for hardcoded demo/test org fallback strings
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          PATTERN='(org-demo-|tenant-a[^-a-zA-Z]|demo-tenant|test-tenant)'
+          CONTEXT_PATTERN='(clerk|orgId|tenantId|x-tenant|x-org)'
+
+          # Find matching lines in non-test source files
+          MATCHES=$(
+            grep -rn -E "$PATTERN" \
+              --include="*.ts" --include="*.tsx" \
+              --include="*.js" --include="*.py" \
+              --exclude-dir=node_modules --exclude-dir=.git \
+              --exclude-dir=dist --exclude-dir=.next \
+              --exclude-dir=coverage --exclude-dir=__tests__ \
+              . 2>/dev/null \
+            | grep -v "\.test\." \
+            | grep -v "\.spec\." \
+            | grep -v "__tests__" \
+            | grep -E "$CONTEXT_PATTERN" \
+            || true
+          )
+
+          if [ -n "$MATCHES" ]; then
+            echo "::warning::Hardcoded demo/test org fallback strings found in non-test code."
+            echo "These become cross-tenant data leaks when env vars are absent."
+            echo ""
+            echo "$MATCHES"
+            echo ""
+            echo "Replace with: const orgId = await getVerifiedOrgId(req)"
+            echo "See: ait-claude-config/docs/known-patterns.md — JWT verification pattern"
+          else
+            echo "OK: no hardcoded demo/test org fallback strings found."
+          fi
+
+          # Always succeed — this is advisory only; Gate E (deep scan) is the hard gate
+          exit 0
