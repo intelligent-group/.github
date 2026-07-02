@@ -50,6 +50,8 @@ jobs:
     name: 'Gate A — Next.js CVE floor'
     runs-on: [self-hosted, ig-self-hosted]
     steps:
+      - name: Purge stale git auth header
+        run: git config --global --unset-all http."https://github.com/".extraheader 2>/dev/null || true
       - uses: actions/checkout@v4
       - name: Check Next.js CVE floor
         shell: bash
@@ -61,6 +63,8 @@ jobs:
     name: 'Gate B — Clerk CSP FAPI host'
     runs-on: [self-hosted, ig-self-hosted]
     steps:
+      - name: Purge stale git auth header
+        run: git config --global --unset-all http."https://github.com/".extraheader 2>/dev/null || true
       - uses: actions/checkout@v4
       - name: Check Clerk CSP includes satellite FAPI host
         shell: bash
