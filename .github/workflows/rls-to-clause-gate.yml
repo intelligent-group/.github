@@ -1,0 +1,74 @@
+name: RLS USING(true) Safety Gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'supabase/migrations/**'
+      - 'apps/**/supabase/migrations/**'
+
+jobs:
+  rls-lint:
+    name: Verify no USING(true) without TO clause
+    runs-on: ubuntu-latest
+    steps:
+      - name: Purge stale git auth header
+        run: git config --global --unset-all http."https://github.com/".extraheader 2>/dev/null || true
+
+      - uses: actions/checkout@v4
+
+      - name: Check for USING(true) without TO in migration files
+        run: |
+          set -e
+
+          # Find all SQL migration files changed in this PR
+          MIGRATION_FILES=$(git diff --name-only origin/main...HEAD -- '*.sql' | grep -i migration || true)
+
+          if [ -z "$MIGRATION_FILES" ]; then
+            echo "No migration files changed in this PR — skipping"
+            exit 0
+          fi
+
+          FAIL=0
+          while IFS= read -r file; do
+            [ -f "$file" ] || continue
+            # Use Python to parse CREATE POLICY blocks accurately
+            python3 << 'PYEOF'
+import re, sys
+
+filepath = "$file"
+with open(filepath) as f:
+    content = f.read()
+
+# Match CREATE POLICY ... ; blocks (multiline)
+policy_blocks = re.findall(
+    r'(CREATE\s+POLICY\s+.*?;)',
+    content,
+    re.DOTALL | re.IGNORECASE
+)
+
+violations = []
+for block in policy_blocks:
+    has_using_true = bool(re.search(r'USING\s*\(\s*true\s*\)', block, re.IGNORECASE))
+    has_to_clause = bool(re.search(r'\bTO\b\s+\w+', block, re.IGNORECASE))
+    if has_using_true and not has_to_clause:
+        violations.append(block.strip()[:200])
+
+if violations:
+    print(f"::error file={filepath}::UNSAFE RLS: {len(violations)} policy(ies) use USING(true) without a TO clause (defaults to PUBLIC)")
+    for v in violations:
+        print(f"  → {repr(v)}")
+    sys.exit(1)
+PYEOF
+            if [ $? -ne 0 ]; then FAIL=1; fi
+          done <<< "$MIGRATION_FILES"
+
+          if [ $FAIL -ne 0 ]; then
+            echo ""
+            echo "::error::One or more migration files contain CREATE POLICY USING(true) without a TO clause."
+            echo "This defaults to PUBLIC and can allow cross-tenant data access."
+            echo "Always scope policies: TO service_role, TO authenticated, or TO anon — never rely on defaults."
+            exit 1
+          fi
+
+          echo "✅ RLS USING(true) gate passed — all policies have TO clause"
