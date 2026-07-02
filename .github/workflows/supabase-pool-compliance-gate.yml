@@ -1,0 +1,224 @@
+name: Supabase Pool Compliance Gate
+
+# Reusable workflow — call from any IG product repo deploying to Cloud Run with:
+#   uses: intelligent-group/.github/.github/workflows/supabase-pool-compliance-gate.yml@main
+#   with:
+#     max_instances: '10'
+#     connection_limit: '2'
+#
+# Gates:
+#   A — Detects pgbouncer/Supavisor usage (port 6543) and REQUIRES DIRECT_URL for Prisma migrations
+#   B — Validates connection pool math: connection_limit × max-instances ≤ 190 (Supavisor limit)
+#
+# Prevents:
+#   - Crash-loops: prisma migrate deploy fails without DIRECT_URL (port 5432 direct connection)
+#   - Pool exhaustion: too many connections across all Cloud Run instances → Supavisor timeout
+
+on:
+  workflow_call:
+    inputs:
+      max_instances:
+        description: 'Cloud Run max-instances value for this service'
+        required: false
+        default: '10'
+        type: string
+      connection_limit:
+        description: 'Prisma connection_limit (from DATABASE_URL datasource block or schema.prisma)'
+        required: false
+        default: '1'
+        type: string
+      skip_direct_url_check:
+        description: 'Set true to skip DIRECT_URL check (use only if not using Supavisor)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  gate-a-direct-url-when-pgbouncer:
+    name: 'Gate A — DIRECT_URL required with pgbouncer/Supavisor'
+    runs-on: [self-hosted, ig-self-hosted]
+    if: ${{ !inputs.skip_direct_url_check }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check DIRECT_URL when using pgbouncer/Supavisor
+        shell: bash
+        run: |
+          set -e
+
+          echo "=== Supabase Pool Compliance Gate A: DIRECT_URL Check ==="
+          echo ""
+
+          # Find Prisma schema
+          SCHEMA=$(find . -name "schema.prisma" -not -path "*/node_modules/*" -not -path "*/.next/*" | head -1)
+
+          # Check if DATABASE_URL uses port 6543 (Supavisor) or pgbouncer mode
+          USES_POOLER=false
+
+          if [ -n "$SCHEMA" ]; then
+            if grep -q "port=6543\|mode=transaction\|sslmode=require.*6543" "$SCHEMA" 2>/dev/null; then
+              USES_POOLER=true
+              echo "✓ Found Prisma schema: $SCHEMA"
+              echo "✓ Detected pgbouncer/Supavisor usage (port 6543 or transaction mode)"
+            fi
+          fi
+
+          # Check env example files
+          for envfile in .env.example .env.local.example docker-compose.yml docker-compose.override.yml; do
+            if [ -f "$envfile" ]; then
+              if grep -qE "DATABASE_URL.*:6543|DATABASE_URL.*pgbouncer|DATABASE_URL.*mode=transaction" "$envfile" 2>/dev/null; then
+                USES_POOLER=true
+                echo "✓ Detected pgbouncer/Supavisor usage in: $envfile"
+              fi
+            fi
+          done
+
+          # Check Cloud Run deploy scripts and workflows
+          if find .github/workflows scripts deploy -name "*.yml" -o -name "*.yaml" -o -name "*.sh" 2>/dev/null | \
+             xargs grep -l "DATABASE_URL.*:6543\|pgbouncer\|mode=transaction" 2>/dev/null; then
+            USES_POOLER=true
+            echo "✓ Detected pgbouncer/Supavisor usage in deploy/CI scripts"
+          fi
+
+          if [ "$USES_POOLER" = "false" ]; then
+            echo "ℹ Not using pgbouncer/Supavisor — Gate A SKIPPED (pool compliance not required)"
+            echo ""
+            exit 0
+          fi
+
+          echo ""
+          echo "CRITICAL: Supavisor detected. Checking for DIRECT_URL..."
+          echo ""
+
+          # DIRECT_URL must be present for Prisma migrate deploy
+          DIRECT_URL_FOUND=false
+
+          if [ -n "$SCHEMA" ]; then
+            if grep -q "DIRECT_URL\|directUrl" "$SCHEMA" 2>/dev/null; then
+              DIRECT_URL_FOUND=true
+              echo "✓ Found DIRECT_URL reference in schema.prisma"
+            fi
+          fi
+
+          for envfile in .env.example .env.local.example docker-compose.yml docker-compose.override.yml; do
+            if [ -f "$envfile" ] && grep -q "DIRECT_URL=" "$envfile" 2>/dev/null; then
+              DIRECT_URL_FOUND=true
+              echo "✓ Found DIRECT_URL= in: $envfile"
+            fi
+          done
+
+          if grep -rq "DIRECT_URL" .github/workflows/ scripts/ deploy/ 2>/dev/null; then
+            DIRECT_URL_FOUND=true
+            echo "✓ Found DIRECT_URL in deploy/CI scripts"
+          fi
+
+          if [ "$DIRECT_URL_FOUND" = "false" ]; then
+            echo ""
+            echo "::error::Gate A FAIL: DIRECT_URL is MISSING."
+            echo ""
+            echo "When DATABASE_URL uses pgbouncer/Supavisor (port 6543),"
+            echo "Prisma migrate deploy REQUIRES a direct connection via DIRECT_URL."
+            echo ""
+            echo "Without DIRECT_URL:"
+            echo "  - prisma migrate deploy crashes on every container boot"
+            echo "  - Cloud Run revision enters crash-loop"
+            echo "  - All traffic fails; entire fleet can become unreachable"
+            echo ""
+            echo "FIX:"
+            echo "  1. Add DIRECT_URL to .env.example (same password as DATABASE_URL, port 5432)"
+            echo "     Example: DIRECT_URL=postgresql://user:pass@db.supabase.co:5432/postgres"
+            echo ""
+            echo "  2. Add DIRECT_URL to Cloud Run deployment (via --update-secrets or gcloud deploy)"
+            echo ""
+            echo "  3. Optional: Update schema.prisma datasource block:"
+            echo "     datasource db {"
+            echo "       provider = \"postgresql\""
+            echo "       url      = env(\"DATABASE_URL\")"
+            echo "       directUrl = env(\"DIRECT_URL\")"
+            echo "     }"
+            echo ""
+            echo "Reference:"
+            echo "  - Prisma + Supavisor: https://supabase.com/docs/guides/database/connecting-to-postgres#prisma"
+            echo "  - Incident: 2026-06-25 ait-ai-gateway (26h outage, missing DIRECT_URL)"
+            echo ""
+            exit 1
+          fi
+
+          echo "✓ Gate A PASS: DIRECT_URL is configured"
+          echo ""
+
+  gate-b-pool-math:
+    name: 'Gate B — Connection pool math (connection_limit × max-instances ≤ 190)'
+    runs-on: [self-hosted, ig-self-hosted]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check connection pool math
+        shell: bash
+        run: |
+          set -e
+
+          echo "=== Supabase Pool Compliance Gate B: Pool Math Check ==="
+          echo ""
+
+          MAX_INSTANCES="${{ inputs.max_instances }}"
+          CONNECTION_LIMIT="${{ inputs.connection_limit }}"
+
+          # Validate numeric input
+          if ! [[ "$MAX_INSTANCES" =~ ^[0-9]+$ ]] || ! [[ "$CONNECTION_LIMIT" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid inputs (must be numeric): max_instances=$MAX_INSTANCES, connection_limit=$CONNECTION_LIMIT"
+            exit 1
+          fi
+
+          TOTAL=$((MAX_INSTANCES * CONNECTION_LIMIT))
+
+          echo "Calculation:"
+          echo "  max_instances        = $MAX_INSTANCES"
+          echo "  connection_limit     = $CONNECTION_LIMIT"
+          echo "  Total connections    = $TOTAL"
+          echo ""
+          echo "Supavisor limit:"
+          echo "  Hard cap             = 200 connections (all Cloud Run instances)"
+          echo "  Safe threshold       = 190 connections (5% headroom)"
+          echo "  Warning threshold    = 150 connections (75% of safe)"
+          echo ""
+
+          if [ "$TOTAL" -gt 190 ]; then
+            echo "::error::Gate B FAIL: Pool math EXCEEDS safe limit"
+            echo ""
+            echo "Current: $TOTAL connections > 190 safe limit"
+            echo ""
+            echo "Incident history:"
+            echo "  - 2026-06-26: Supavisor pool exhaustion (all queries timeout, fleet-wide outage)"
+            echo "  - Cause: connection_limit × max-instances → 200+ simultaneous connections"
+            echo ""
+            echo "SOLUTION:"
+            echo "  Reduce either max_instances or connection_limit."
+            echo ""
+            echo "  Example safe configurations:"
+            if [ "$CONNECTION_LIMIT" -gt 0 ]; then
+              MAX_SAFE=$((190 / CONNECTION_LIMIT))
+              echo "    - max_instances=$MAX_SAFE with connection_limit=$CONNECTION_LIMIT → $((MAX_SAFE * CONNECTION_LIMIT)) total"
+            fi
+            echo "    - max_instances=$MAX_INSTANCES with connection_limit=1 → $MAX_INSTANCES total"
+            echo ""
+            echo "  Most common: set connection_limit=2, max_instances=10 → 20 total (very safe)"
+            echo ""
+            echo "Reference:"
+            echo "  - Supabase connection pooling: https://supabase.com/docs/guides/database/connecting-to-postgres#connection-pooler"
+            echo "  - Incident: 2026-06-26 fleet-wide pool exhaustion"
+            echo ""
+            exit 1
+          fi
+
+          if [ "$TOTAL" -gt 150 ]; then
+            echo "::warning::Pool math approaching limit: $TOTAL/190 (>80% of safe threshold)"
+            echo "Current capacity is acceptable, but consider reducing for headroom."
+            echo ""
+          fi
+
+          echo "✓ Gate B PASS: $TOTAL ≤ 190 (safe)"
+          echo ""
