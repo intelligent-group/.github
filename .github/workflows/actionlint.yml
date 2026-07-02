@@ -25,6 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Purge stale git auth header
+        run: git config --global --unset-all http."https://github.com/".extraheader 2>/dev/null || true
       - uses: actions/checkout@v4
 
       - name: Run actionlint
