@@ -46,6 +46,13 @@ name: Pick runner
 #       needs: pick
 #       runs-on: ${{ fromJSON(needs.pick.outputs.runs_on) }}
 #       steps:
+#         # REQUIRED first step whenever runs_on can resolve to a self-hosted
+#         # label ("pc-cpu" / "ig-self-hosted"): those runners are persistent
+#         # boxes, and a stale git http.extraheader left by a prior interrupted
+#         # job collides with the one actions/checkout injects here, producing
+#         # `remote: Duplicate header: "Authorization"` (HTTP 400) at checkout.
+#         # No-op on a clean box and on ubuntu-latest fallback — safe always-on.
+#         - uses: intelligent-group/.github/actions/purge-stale-git-auth@main
 #         - uses: actions/checkout@v4
 #         - run: pnpm install && pnpm test
 #
