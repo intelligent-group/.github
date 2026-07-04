@@ -171,10 +171,27 @@ jobs:
           git config --global http."https://github.com/".extraheader "AUTHORIZATION: basic ${AUTH}"
 
       - name: Install dependencies
+        # Repos pin their pnpm version via package.json's "packageManager" field
+        # (e.g. AiTBMS pins pnpm@10.x and relies on pnpm-10-only pnpm-workspace.yaml
+        # features like `overrides:`). Hardcoding `npm install -g pnpm@9` here
+        # silently ignores that pin: pnpm@9 doesn't understand the newer
+        # workspace-file schema and a `--frozen-lockfile` install then fails with
+        # ERR_PNPM_LOCKFILE_CONFIG_MISMATCH (see AiTBMS PR #454). corepack (bundled
+        # with Node >=16.9, active by default via setup-node) reads the checked-out
+        # repo's own package.json "packageManager" field and activates that exact
+        # pinned version, so every consumer repo gets the pnpm it actually asked
+        # for. Repos with no pin at all fall back to pnpm@10 (current major) so
+        # behavior for unpinned repos doesn't regress to an unspecified version.
         if: steps.skip.outputs.skip != 'true'
         run: |
           if [ -f pnpm-lock.yaml ]; then
-            npm install -g pnpm@9 --quiet
+            corepack enable
+            if node -e "const pm=(require('./package.json').packageManager||''); process.exit(pm.startsWith('pnpm@') ? 0 : 1)" 2>/dev/null; then
+              corepack prepare --activate
+            else
+              echo "::notice::No packageManager pin found in package.json; defaulting to pnpm@10"
+              corepack prepare pnpm@10 --activate
+            fi
             pnpm install --frozen-lockfile
           else
             npm ci
