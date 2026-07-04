@@ -137,38 +137,40 @@ jobs:
         with:
           node-version: ${{ inputs.node_version }}
 
-      - name: Configure git HTTPS for private github deps
+      - name: Configure git HTTPS for private github deps (job-scoped, no persistent state)
         if: steps.skip.outputs.skip != 'true'
+        # ROOT CAUSE (2026-07-04): this step used to write --global git config
+        # (url.*.insteadOf + http.*.extraheader). Self-hosted runners are
+        # PERSISTENT (pc-ultra7-mruser, pc-ultra7-igorg-orglevel, ...), so those
+        # entries survived in $HOME/.gitconfig past the end of THIS job and
+        # leaked into every other job sharing that box's $HOME -- including
+        # concurrent jobs from other repos -- until either the next run's
+        # pre-checkout purge or the periodic runner-hygiene sweep happened to
+        # catch it. That's a credential-hygiene bug on a shared, persistent
+        # box, not just a flake.
+        #
+        # Fix: use git's per-process GIT_CONFIG_COUNT/KEY/VALUE_n env-var form
+        # (https://git-scm.com/docs/git-config#ENVIRONMENT) instead of writing
+        # any file. These are exported via $GITHUB_ENV, which GitHub Actions
+        # scopes to the REMAINING STEPS OF THIS JOB ONLY -- never written to
+        # $HOME/.gitconfig, never visible to any other job, and gone the
+        # instant this job ends (no cleanup step required, nothing to forget).
         run: |
           TOKEN="${{ secrets.IG_PACKAGES_TOKEN || github.token }}"
-          # Self-hosted runners are PERSISTENT, so --global git config survives across
-          # jobs. The previous approach embedded the token IN the rewrite URL
-          # (url."https://x-access-token:$TOKEN@github.com/".insteadOf ...), which makes
-          # the config KEY differ per token -- stale rules from prior runs (with an old
-          # or repo-scoped token) accumulate in ~/.gitconfig and can shadow the correct
-          # one, so a valid IG_PACKAGES_TOKEN still 404s ("Repository not found") on a
-          # private sibling dep. Fix: purge any prior github.com rewrites/auth, then use
-          # a token-AGNOSTIC insteadOf + http.extraheader (the actions/checkout pattern)
-          # whose config keys never embed the token.
-          # 1. Purge stale token-embedded insteadOf rules for github.com.
-          git config --global --name-only --get-regexp '^url\..*github\.com.*\.insteadof$' 2>/dev/null \
-            | while read -r key; do git config --global --unset-all "$key" 2>/dev/null || true; done
-          # 2. Purge any prior github.com auth header at EVERY scope. actions/checkout
-          #    sets its own --local extraheader (with the repo-scoped github.token); if
-          #    ours (--global) coexists, npm's git op sends BOTH and github rejects the
-          #    request with `Duplicate header: "Authorization"` (HTTP 400). Clear all
-          #    scopes so exactly one extraheader (ours, below) remains.
-          git config --system --unset-all http."https://github.com/".extraheader 2>/dev/null || true
-          git config --global --unset-all http."https://github.com/".extraheader 2>/dev/null || true
-          git config --local  --unset-all http."https://github.com/".extraheader 2>/dev/null || true
-          # 3. Token-agnostic rewrite: npm's `github:` shorthand resolves to git+ssh,
-          #    so rewrite the ssh/scp forms to plain https (no token in URL or key).
-          git config --global url."https://github.com/".insteadOf "git@github.com:"
-          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-          # 4. Auth via extraheader -- key is constant regardless of token value.
+          # Token-agnostic rewrite: npm's `github:` shorthand resolves to
+          # git+ssh, so rewrite the ssh/scp forms to plain https (no token in
+          # the rewrite rule itself).
           AUTH=$(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')
           echo "::add-mask::${AUTH}"
-          git config --global http."https://github.com/".extraheader "AUTHORIZATION: basic ${AUTH}"
+          {
+            echo "GIT_CONFIG_COUNT=3"
+            echo "GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf"
+            echo "GIT_CONFIG_VALUE_0=git@github.com:"
+            echo "GIT_CONFIG_KEY_1=url.https://github.com/.insteadOf"
+            echo "GIT_CONFIG_VALUE_1=ssh://git@github.com/"
+            echo "GIT_CONFIG_KEY_2=http.https://github.com/.extraheader"
+            echo "GIT_CONFIG_VALUE_2=AUTHORIZATION: basic ${AUTH}"
+          } >> "$GITHUB_ENV"
 
       - name: Install dependencies
         # Repos pin their pnpm version via package.json's "packageManager" field
