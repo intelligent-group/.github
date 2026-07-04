@@ -1,0 +1,43 @@
+name: 'Purge stale runner git auth'
+description: >
+  Clears stale git http.extraheader / url.*.insteadOf auth overrides left
+  behind by an interrupted job on a persistent self-hosted runner, before
+  actions/checkout injects its own auth for the current job. See README.md
+  in this directory for the full defect writeup. No-op (and harmless) on
+  clean checkouts and on ephemeral GitHub-hosted runners.
+author: 'intelligent-group'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Purge stale extraheader / insteadOf overrides
+      shell: bash
+      run: |
+        set +e
+        HDR='http.https://github.com/.extraheader'
+
+        # 1. extraheader at every config scope actions/checkout (or a prior job's
+        #    "Configure git" step) could have written it to. A stale --global or
+        #    --system entry surviving from an earlier, interrupted job collides
+        #    with the --local one actions/checkout sets for THIS job -> git sends
+        #    both -> GitHub rejects with `Duplicate header: "Authorization"` (400).
+        git config --system --unset-all "$HDR" 2>/dev/null
+        git config --global --unset-all "$HDR" 2>/dev/null
+        git config --local  --unset-all "$HDR" 2>/dev/null
+
+        # 2. Belt-and-suspenders: some self-hosted boxes run the runner service
+        #    under a different user/HOME than the interactive shell, so also
+        #    sweep the well-known gitconfig file locations directly.
+        for f in /etc/gitconfig "$HOME/.gitconfig" /home/*/.gitconfig; do
+          [ -f "$f" ] && git config --file "$f" --unset-all "$HDR" 2>/dev/null
+        done
+
+        # 3. Stale url.*.insteadOf rewrites (e.g. a token-embedded github.com
+        #    rewrite left by a prior job's private-package auth step) can also
+        #    shadow this job's checkout/auth setup even after (1)/(2) above.
+        for scope in --system --global --local; do
+          git config $scope --name-only --get-regexp '^url\..*\.insteadof$' 2>/dev/null \
+            | while read -r key; do git config $scope --unset-all "$key" 2>/dev/null; done
+        done
+
+        exit 0

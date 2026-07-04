@@ -50,6 +50,11 @@ jobs:
     name: 'Gate A — Next.js CVE floor'
     runs-on: [self-hosted, ig-self-hosted]
     steps:
+      # Self-hosted runners persist git config across jobs; a stale
+      # http.extraheader left by a prior interrupted job collides with the
+      # one actions/checkout injects here -> "Duplicate header: Authorization"
+      # (HTTP 400) -> every job on the box fails at checkout. No-op elsewhere.
+      - uses: intelligent-group/.github/actions/purge-stale-git-auth@main
       - uses: actions/checkout@v4
       - name: Check Next.js CVE floor
         shell: bash
@@ -61,6 +66,8 @@ jobs:
     name: 'Gate B — Clerk CSP FAPI host'
     runs-on: [self-hosted, ig-self-hosted]
     steps:
+      # See Gate A above — persistent-runner stale git auth purge.
+      - uses: intelligent-group/.github/actions/purge-stale-git-auth@main
       - uses: actions/checkout@v4
       - name: Check Clerk CSP includes satellite FAPI host
         shell: bash

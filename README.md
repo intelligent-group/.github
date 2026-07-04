@@ -15,6 +15,11 @@ propagate to every repo for free — no per-repo PR needed.
 | `.github/ISSUE_TEMPLATE/*.md` | Default issue templates (bug + feature) |
 | `.github/PULL_REQUEST_TEMPLATE.md` | Default PR template |
 | `SECURITY.md` | Default security disclosure policy |
+| `.github/workflows/_pick-runner.yml` | Reusable — picks a runner tier (PC self-hosted / MIG / ubuntu-latest) |
+| `.github/workflows/_qa-chrome-gate.yml` | Reusable — Playwright Chrome QA gate |
+| `.github/workflows/_qa-production-ready.yml` | Reusable — marks a PR production-ready once all gates pass |
+| `.github/workflows/ig-product-gates.yml` | Reusable — Gates A-D (Next.js CVE floor, Clerk CSP/origins, /sign-in) |
+| `actions/purge-stale-git-auth/` | Composite action — clears stale git auth left on persistent self-hosted runners before `actions/checkout` (see its README) |
 
 ## Source-of-truth coupling
 
