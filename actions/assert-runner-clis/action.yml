@@ -1,0 +1,59 @@
+name: 'Assert required CLIs on runner'
+description: >
+  Fails fast, at job start, if a required CLI (e.g. gcloud) is missing from
+  PATH on the runner — instead of the failure surfacing deep inside an
+  unrelated step. See README.md in this directory for the incidents that
+  motivated this action. Safe on GitHub-hosted (ephemeral) runners too.
+author: 'intelligent-group'
+
+inputs:
+  required:
+    description: >
+      Space-separated list of CLI binary names to assert are on PATH.
+      Callers on gcloud-dependent jobs should pass 'gcloud gh node'
+      explicitly — the default excludes gcloud since not every job needs
+      it and GitHub-hosted runners don't carry it.
+    required: false
+    default: 'gh node'
+  runner-name:
+    description: >
+      Pass ${{ runner.name }} from the calling job — composite actions
+      cannot read the calling job's context directly, only their own
+      inputs.
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Assert required CLIs are present
+      shell: bash
+      run: |
+        set +e
+        MISSING=()
+        FOUND=()
+        for CLI in ${{ inputs.required }}; do
+          PATHTO=$(command -v "$CLI" 2>/dev/null)
+          if [ -n "$PATHTO" ]; then
+            FOUND+=("$CLI: $PATHTO")
+          else
+            MISSING+=("$CLI")
+          fi
+        done
+
+        if [ "${#FOUND[@]}" -gt 0 ]; then
+          echo "--- Present ---"
+          printf '  %s\n' "${FOUND[@]}"
+        fi
+
+        if [ "${#MISSING[@]}" -gt 0 ]; then
+          RUNNER_LABEL="${{ inputs.runner-name }}"
+          RUNNER_LABEL="${RUNNER_LABEL:-unknown}"
+          MISSING_LIST=$(printf '%s, ' "${MISSING[@]}")
+          MISSING_LIST="${MISSING_LIST%, }"
+          echo "::error::Missing required CLI(s) on runner '${RUNNER_LABEL}': ${MISSING_LIST}. Provision via: gh workflow run runner-provision-clis.yml -R intelligent-group/ait-claude-config --ref main"
+          exit 1
+        fi
+
+        echo "All required CLIs present: ${{ inputs.required }}"
+        exit 0
