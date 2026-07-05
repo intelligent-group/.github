@@ -113,6 +113,27 @@ jobs:
             | while read -r key; do git config --global --unset-all "$key" 2>/dev/null || true; done
 
       - uses: actions/checkout@v4
+        with:
+          # ROOT CAUSE (2026-07-05): actions/checkout's default
+          # persist-credentials:true writes a LOCAL (repo-scoped)
+          # http.https://github.com/.extraheader in the checked-out repo's
+          # .git/config, authenticated with this job's GITHUB_TOKEN. That
+          # config entry matches the whole https://github.com/ origin, not
+          # just this repo. Later in this same job, "Configure git HTTPS for
+          # private github deps" adds ANOTHER extraheader for the same
+          # https://github.com/ prefix (job-scoped, via GIT_CONFIG_* env
+          # vars) so npm can fetch private git dependencies (e.g.
+          # @intelligent-group/ait-media-chassis). git config allows multiple
+          # values for a multi-valued key like extraheader and sends ALL of
+          # them, so any git request to github.com in this job (including
+          # npm's git ls-remote for a private dependency) carries TWO
+          # Authorization headers -> GitHub rejects with `Duplicate header:
+          # "Authorization"` (HTTP 400). No step after checkout needs git
+          # push/pull credentials against this repo (Supabase logging and
+          # SHA-skip check use curl, not git), so persist-credentials:false
+          # removes the conflicting local credential at the source instead of
+          # trying to reconcile two independently-written extraheader entries.
+          persist-credentials: false
 
       - name: Skip if SHA already passed
         id: skip
