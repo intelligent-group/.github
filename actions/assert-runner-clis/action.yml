@@ -17,9 +17,18 @@ inputs:
     default: 'gh node'
   runner-name:
     description: >
-      Pass ${{ runner.name }} from the calling job — composite actions
-      cannot read the calling job's context directly, only their own
-      inputs.
+      Pass the calling job's runner-name context value here (the double-curly
+      template syntax wrapping it, read literally rather than typed out here
+      on purpose) -- composite actions cannot read the calling job's context
+      directly, only their own inputs. NOTE: do not put that template syntax,
+      written out literally, anywhere in this file, including inside a plain
+      description string like this one -- GitHub's action.yml validator
+      evaluates it wherever it appears and fails hard with "Unrecognized
+      named-value" since the runner context isn't available at composite
+      metadata scope. That exact mistake here previously broke every job on
+      every repo using this action fleet-wide (see
+      intelligent-group/ait-innercircle's Deploy workflow failing on every
+      run 2026-07-05 through 2026-07-07).
     required: false
     default: ''
 
