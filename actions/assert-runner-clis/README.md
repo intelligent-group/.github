@@ -58,6 +58,41 @@ gh workflow run runner-provision-clis.yml -R intelligent-group/ait-claude-config
 `required` defaults to `'gh node'` if omitted — pass the full list your
 job actually needs (e.g. add `gcloud`) explicitly.
 
+## Post-mortem: the action itself broke everything it gated (2026-07-05 – 2026-07-07)
+
+The `runner-name` input's `description:` field (in this README's own "Fix"
+example above, and originally in `action.yml`) documented its usage with the
+literal text `${{ runner.name }}`. GitHub Actions template-evaluates every
+`${{ }}` token found anywhere in an `action.yml` manifest — including plain
+`description:` strings meant only as human-readable docs, not just `run:`/
+`if:` expressions. The `runner` context isn't available at manifest-parse
+time in that position, so loading the action itself failed with
+`Unrecognized named-value: 'runner'` at "Set up job" — before checkout, before
+any step, on every single caller — with no code change to any caller needed
+to trigger it.
+
+Because this action runs first in `deploy.yml`'s `deploy-vercel` job (exactly
+per its own usage guidance above), it silently blocked
+`intelligent-group/ait-innercircle`'s production Vercel deploy on every push
+to `main` for two days, while every other CI check (build, typecheck, PR
+checks) stayed green — nothing surfaced this as a deploy problem until a
+Playwright E2E run against live prod caught a stale ambiguous-FK PostgREST
+error (`PGRST201`) that had already been fixed in `main` days earlier.
+
+`actionlint.yml` in this repo never caught it: it only lints
+`.github/workflows/*.yml`, never `actions/**/action.yml` — composite action
+manifests use a different schema and actionlint's workflow linter doesn't
+parse them. `actions-smoke-test.yml` (added alongside this fix) closes that
+gap by actually *invoking* every composite action in `actions/**` on a real
+GitHub-hosted runner, so a manifest-parse failure like this one fails CI on
+the introducing PR instead of shipping via auto-merge.
+
+**Lesson for any future `action.yml` in this repo:** never write a literal
+`${{ ... }}` token inside a `description:` field, even as an illustrative
+example. Describe the context/field being referenced in prose instead (e.g.
+"the runner context's `name` field") or wrap illustrative snippets in a
+way that avoids the literal double-curly-brace token entirely.
+
 ## Longer-term: provisioning
 
 This action is the gate. The provisioning workflow

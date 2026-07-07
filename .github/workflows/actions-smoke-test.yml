@@ -1,0 +1,79 @@
+name: Composite actions smoke test
+
+# Actually INVOKES every composite action in actions/**, on GitHub-hosted
+# runners, instead of only linting the workflow files that call them.
+#
+# WHY THIS EXISTS: actionlint.yml only lints .github/workflows/*.yml — it
+# never parses actions/**/action.yml at all, since composite action manifests
+# use a different schema than workflow files. That gap let
+# actions/assert-runner-clis/action.yml merge (2026-07-05, PR #32,
+# non-sensitive-path auto-merge) with a literal "${{ runner.name }}" token
+# inside a plain `description:` string. GitHub Actions template-evaluates
+# every "${{ }}" in an action.yml file, including description text meant as
+# human-readable documentation — that stray reference to a context
+# unavailable at manifest-parse time failed the action's very first step
+# ("Set up job", before checkout even runs) with a cryptic "Unrecognized
+# named-value: 'runner'" error, on EVERY caller, for two days
+# (2026-07-05 through 2026-07-07) before being traced back here. It broke
+# every heavy/gcloud-tier job across the fleet that used this action,
+# including ait-innercircle's "Deploy — Vercel (prod)" job — production
+# silently stopped receiving new deploys with no failure surfaced anywhere
+# near the actual cause.
+#
+# This workflow actually runs each composite action for real (not just
+# lints its YAML), so a manifest-parse failure like this one fails CI on
+# the PR that introduces it, instead of silently shipping via auto-merge.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'actions/**'
+  push:
+    branches: [main]
+    paths:
+      - 'actions/**'
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  assert-runner-clis-smoke:
+    name: "Smoke: assert-runner-clis"
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      # Present-CLI case: gh + node ship on every GitHub-hosted runner, so this
+      # must succeed. A manifest-parse failure (the actual 2026-07-05 to
+      # 2026-07-07 bug) fails here, before "All required CLIs present" even runs.
+      - name: Invoke with CLIs that ARE present (must pass)
+        uses: ./actions/assert-runner-clis
+        with:
+          required: 'gh node'
+          runner-name: ${{ runner.name }}
+
+      # Missing-CLI case: asserts the action's actual failure-detection logic
+      # still works (not just that the manifest parses) — a CLI name that
+      # will never exist on any runner must make this step fail.
+      - name: Invoke with a CLI that is NOT present (must fail)
+        id: expect_fail
+        continue-on-error: true
+        uses: ./actions/assert-runner-clis
+        with:
+          required: 'this-cli-does-not-exist-9c3f1a'
+          runner-name: ${{ runner.name }}
+
+      - name: Assert the missing-CLI case actually failed
+        run: |
+          if [ "${{ steps.expect_fail.outcome }}" != "failure" ]; then
+            echo "::error::assert-runner-clis did not fail on a missing CLI — detection logic is broken."
+            exit 1
+          fi
+          echo "assert-runner-clis correctly failed on a missing CLI."
