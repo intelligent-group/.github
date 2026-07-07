@@ -17,19 +17,19 @@ inputs:
     default: 'gh node'
   runner-name:
     description: >
-      Pass the calling job's runner context name (accessed via the runner
-      context's name field) here — composite actions cannot read the
-      calling job's context directly, only their own inputs. NOTE: do not
-      write this field's example value using the literal double-curly-brace
-      expression syntax — GitHub Actions template-evaluates every "${{ }}"
-      token in an action.yml file, including inside plain description
-      strings, and a stray reference to a context that isn't available at
-      manifest-parse time (e.g. the runner context here) fails the entire
-      composite action before any step runs. This is exactly the bug this
-      description used to have (2026-07-05 to 2026-07-07 outage — broke
-      every caller's job at "Set up job", before checkout, silently
-      blocking prod deploys with a cryptic "Unrecognized named-value"
-      error). See README.md.
+      Pass the calling job's runner context name (the runner context's
+      name field) here — composite actions cannot read the calling job's
+      context directly, only their own inputs. NOTE: do not write this
+      field's example value using an actual expression-interpolation
+      token in this description — GitHub Actions evaluates that syntax
+      anywhere it appears in an action.yml manifest, including inside
+      plain description strings, and a reference to a context that is
+      not available at manifest-parse time (e.g. the runner context)
+      fails the entire composite action before any step runs. This is
+      exactly the bug this description used to have (2026-07-05 to
+      2026-07-07 outage — broke every caller's job at "Set up job",
+      before checkout, silently blocking prod deploys with a cryptic
+      "Unrecognized named-value" error). See README.md.
     required: false
     default: ''
 
