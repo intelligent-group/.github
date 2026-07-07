@@ -206,6 +206,11 @@ jobs:
         # for. Repos with no pin at all fall back to pnpm@10 (current major) so
         # behavior for unpinned repos doesn't regress to an unspecified version.
         if: steps.skip.outputs.skip != 'true'
+        env:
+          # .npmrc in consumer repos sets //npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}.
+          # Without this env var, npm ci returns 401 for @intelligent-group/* packages.
+          # IG_PACKAGES_TOKEN has the correct scope; fall back to GITHUB_TOKEN for public pkgs.
+          NODE_AUTH_TOKEN: ${{ secrets.IG_PACKAGES_TOKEN || github.token }}
         run: |
           if [ -f pnpm-lock.yaml ]; then
             corepack enable
