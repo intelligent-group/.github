@@ -4,6 +4,13 @@ name: actionlint
 # Catches: secrets-context-in-if, undefined-secrets, shellcheck on run blocks.
 # A broken reusable workflow silently breaks every caller fleet-wide — this gate
 # prevents fleet-wide P0s like the `secrets` in step `if:` incident (2026-06-28).
+#
+# Also lints actions/*/action.yml composite manifests via
+# scripts/ci/lint-composite-actions.py, since raven-actions/actionlint@v2 (like
+# actionlint itself, v1.7.x) does not parse action.yml as a composite action
+# manifest at all -- root-cause defect class of the 2026-07-05 ait-innercircle
+# prod-dead incident (#35): an undeclared ${{ inputs.X }} silently evaluates to
+# an empty string instead of failing.
 
 on:
   pull_request:
@@ -35,3 +42,8 @@ jobs:
           # analyzes inline `run:` bash blocks for shell mistakes.
           # fail-on-error defaults to true — any actionlint error fails this job.
           files: ".github/workflows/*.yml,.github/workflows/*.yaml"
+
+      - name: Lint composite action manifests
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check pyyaml
+          python3 scripts/ci/lint-composite-actions.py actions
