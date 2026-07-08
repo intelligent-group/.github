@@ -1,0 +1,25 @@
+name: sample
+on: [push]
+jobs:
+  deploy:                # hang-class: project npm ci, non-browser, no skip-env -> FAIL
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm ci
+      - run: vercel build
+  deploy-fixed:          # project npm ci but skip-env present -> not flagged
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm ci
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+      - run: vercel build
+  e2e:                   # browser job with a job timeout -> not flagged
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - run: npm ci
+      - run: npx playwright test
+  tools:                 # global install -> not a project install -> not flagged
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm install -g vercel@latest
