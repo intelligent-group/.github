@@ -45,5 +45,5 @@ jobs:
 
       - name: Lint composite action manifests
         run: |
-          python3 -m pip install --quiet --disable-pip-version-check pyyaml
+          python3 -c "import yaml" 2>/dev/null || python3 -m pip install --quiet --disable-pip-version-check pyyaml 2>/dev/null || python3 -m pip install --quiet --disable-pip-version-check --break-system-packages pyyaml
           python3 scripts/ci/lint-composite-actions.py actions
