@@ -23,3 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: npm install -g vercel@latest
+  probe:                 # hang-class: named-pkg install on fresh checkout reconciles
+    runs-on: ubuntu-latest   # the root tree -> runs playwright postinstall, non-browser,
+    steps:                   # no skip-env -> FAIL (lesson point 5)
+      - run: npm install --no-save tsx
+      - run: npx tsx scripts/probe.ts

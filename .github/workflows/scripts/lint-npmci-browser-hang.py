@@ -18,8 +18,9 @@ project-level npm install found in .github/workflows/*.yml:
       job or step level (a stalled download hangs forever instead of failing fast).
 
 NOT flagged (these never run the project's browser postinstalls):
-  `npm install -g <pkg>`, `npm install <named-pkg>`, `--ignore-scripts`,
-  `--package-lock-only`.
+  `npm install -g <pkg>`, `--ignore-scripts`, `--package-lock-only`, `npm audit`.
+  NOTE: `npm install [--no-save] <named-pkg>` on a fresh checkout IS flagged — it
+  reconciles the whole root tree and runs playwright's postinstall (lesson point 5).
 
 Exit 1 when FAILs exist and --enforce is passed; otherwise exit 0 (report-only).
 Findings are printed and emitted as GitHub Actions annotations.
@@ -86,11 +87,13 @@ def is_project_install(cmd):
             rest = m.group(2)
             if re.search(r"(^|\s)(-g|--global)(\s|$)", rest):
                 continue  # global install — not the project
-            # any non-flag token after install == a named package (not project)
-            tokens = [t for t in rest.split() if t and not t.startswith("-")]
-            if tokens:
-                continue  # `npm install <pkg>` — named
-            return True   # bare `npm install` / `npm i` — project install
+            # bare `npm install`/`npm i` AND `npm install [--no-save] <named-pkg>`
+            # both reconcile the full root package.json tree on a fresh checkout
+            # (no prior `npm ci` -> no node_modules) and run the project's browser
+            # postinstall. So a named-pkg install is NOT automatically safe; only
+            # -g / --ignore-scripts / --package-lock-only (handled above) avoid it.
+            # (2026-07-08 fleet-sweep correction; ref lesson point 5.)
+            return True
     return False
 
 

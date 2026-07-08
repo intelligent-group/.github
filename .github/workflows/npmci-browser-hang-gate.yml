@@ -83,6 +83,6 @@ jobs:
           fi
           out="$( cd "$fixture" && python "$script" )"
           echo "$out"
-          echo "$out" | grep -q "FAIL (hang-class, non-browser job, no skip-env): 1" \
-            || { echo "SELF-TEST FAILED: expected exactly 1 FAIL (deploy job only)"; exit 1; }
-          echo "self-test passed: skip-env / job-timeout / global-install cases correctly NOT flagged"
+          echo "$out" | grep -q "FAIL (hang-class, non-browser job, no skip-env): 2" \
+            || { echo "SELF-TEST FAILED: expected exactly 2 FAIL (deploy + named-pkg probe)"; exit 1; }
+          echo "self-test passed: skip-env / job-timeout / global-install cases correctly NOT flagged; bare-ci AND named-pkg probe both caught"
