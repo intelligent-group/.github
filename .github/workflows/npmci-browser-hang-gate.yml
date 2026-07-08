@@ -1,0 +1,88 @@
+name: npm-ci browser-download-hang gate
+
+# Fleet gate that catches the "npm-ci browser-download hang" class:
+# a deploy/build/lint job runs a project `npm ci`/`npm install` while
+# puppeteer/playwright are in package.json, in a job that never launches a
+# browser and has no PUPPETEER_SKIP_DOWNLOAD / PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD
+# in scope -> the browser-binary postinstall stalls the runner and hangs the job.
+# Reference incident: intelligent-group/intelligentio deploy-production, 2026-07-08.
+#
+# Use from any IG product repo:
+#   jobs:
+#     npmci-hang-gate:
+#       uses: intelligent-group/.github/.github/workflows/npmci-browser-hang-gate.yml@main
+#       with:
+#         enforce: false   # start report-only; flip to true to block PRs
+#
+# Report-only (default): findings appear as annotations, job stays green.
+# enforce: true: the job FAILS when a hang-class job is found.
+
+on:
+  workflow_call:
+    inputs:
+      enforce:
+        description: 'Fail the job when a hang-class install is found (default report-only).'
+        required: false
+        type: boolean
+        default: false
+  # Self-test on changes to the gate itself, so the linter can't rot silently.
+  push:
+    paths:
+      - '.github/workflows/npmci-browser-hang-gate.yml'
+      - '.github/workflows/scripts/lint-npmci-browser-hang.py'
+  pull_request:
+    paths:
+      - '.github/workflows/npmci-browser-hang-gate.yml'
+      - '.github/workflows/scripts/lint-npmci-browser-hang.py'
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: npm-ci hang gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install PyYAML
+        run: pip install pyyaml
+        timeout-minutes: 2
+      - name: Resolve linter (works when called from a product repo)
+        id: linter
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -f .github/workflows/scripts/lint-npmci-browser-hang.py ]; then
+            echo "path=.github/workflows/scripts/lint-npmci-browser-hang.py" >> "$GITHUB_OUTPUT"
+          else
+            # Called from a product repo that doesn't vendor the script — fetch from this shared repo.
+            mkdir -p .gate
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github.raw" \
+              "https://api.github.com/repos/intelligent-group/.github/contents/.github/workflows/scripts/lint-npmci-browser-hang.py?ref=main" \
+              -o .gate/lint-npmci-browser-hang.py
+            echo "path=.gate/lint-npmci-browser-hang.py" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run gate
+        run: |
+          python "${{ steps.linter.outputs.path }}" ${{ inputs.enforce && '--enforce' || '' }}
+      - name: Self-test against committed fixtures
+        if: ${{ github.repository == 'intelligent-group/.github' }}
+        run: |
+          set -euo pipefail
+          script="$(pwd)/.github/workflows/scripts/lint-npmci-browser-hang.py"
+          fixture="$(pwd)/.github/workflows/scripts/testdata"
+          # enforce mode must FAIL on the hang-class fixture (exactly 1 FAIL job)
+          if ( cd "$fixture" && python "$script" --enforce ); then
+            echo "SELF-TEST FAILED: enforce did not flag the hang-class fixture"; exit 1
+          fi
+          out="$( cd "$fixture" && python "$script" )"
+          echo "$out"
+          echo "$out" | grep -q "FAIL (hang-class, non-browser job, no skip-env): 2" \
+            || { echo "SELF-TEST FAILED: expected exactly 2 FAIL (deploy + named-pkg probe)"; exit 1; }
+          echo "self-test passed: skip-env / job-timeout / global-install cases correctly NOT flagged; bare-ci AND named-pkg probe both caught"
