@@ -70,8 +70,15 @@ on:
     inputs:
       target_workflow_path:
         description: "Path (relative to repo root) to the workflow file whose dependabot skip-check step should be proxy-tested, e.g. .github/workflows/supabase-preview.yml"
-        required: true
+        required: false
         type: string
+        # No skip-check step lives in this file -- every step below passes
+        # --allow-not-found, so an un-set/default target just becomes a
+        # no-op main check while the self-test (below, independent of this
+        # input) still runs for real. This default only matters for the
+        # self-triggering push/pull_request runs on THIS repo (see `on:`
+        # below); real callers always pass their own target_workflow_path.
+        default: .github/workflows/_dependabot-context-proxy.yml
       target_ref:
         description: "Git ref/SHA to check out before extracting the target file. Defaults to the caller's own ref -- override to pin an old (pre-fix) commit for validation runs."
         required: false
@@ -87,6 +94,20 @@ on:
         required: false
         type: boolean
         default: false
+  # Self-test on changes to the proxy itself, so it can't rot silently and so
+  # this repo's own PRs get a REAL GitHub Actions-triggered run (not just a
+  # local reproduction) as validation -- same convention as
+  # npmci-browser-hang-gate.yml in this repo.
+  push:
+    paths:
+      - '.github/workflows/_dependabot-context-proxy.yml'
+      - '.github/workflows/scripts/dependabot_context_proxy.py'
+      - '.github/workflows/scripts/testdata/dependabot-proxy/**'
+  pull_request:
+    paths:
+      - '.github/workflows/_dependabot-context-proxy.yml'
+      - '.github/workflows/scripts/dependabot_context_proxy.py'
+      - '.github/workflows/scripts/testdata/dependabot-proxy/**'
 
 # Deliberately NOT `secrets: inherit` and NOT requesting any custom secret --
 # this job only ever sees GITHUB_TOKEN, scoped down by the block below. This
