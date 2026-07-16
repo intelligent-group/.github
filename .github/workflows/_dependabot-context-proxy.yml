@@ -119,7 +119,7 @@ permissions:
 
 jobs:
   proxy:
-    name: dependabot-context proxy — ${{ inputs.target_workflow_path }}
+    name: dependabot-context proxy
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -153,16 +153,23 @@ jobs:
             echo "path=.gate/dependabot_context_proxy.py" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Resolve target (workflow_call inputs are empty on push/pull_request self-trigger)
+        id: target
+        run: |
+          set -euo pipefail
+          target="${{ inputs.target_workflow_path }}"
+          echo "path=${target:-.github/workflows/_dependabot-context-proxy.yml}" >> "$GITHUB_OUTPUT"
+
       - name: Static gate check (class 4 — ungated dependent steps)
-        run: python "${{ steps.script.outputs.path }}" --target "${{ inputs.target_workflow_path }}" --mode static-only --allow-not-found --repository "${{ github.repository }}"
+        run: python "${{ steps.script.outputs.path }}" --target "${{ steps.target.outputs.path }}" --mode static-only --allow-not-found --repository "${{ github.repository }}"
 
       - name: Synthetic no-migration scenario (expect skip=true)
         if: ${{ !inputs.skip_synthetic_scenarios }}
-        run: python "${{ steps.script.outputs.path }}" --target "${{ inputs.target_workflow_path }}" --mode synthetic-no-migration --expect-skip true --allow-not-found --migration-test-path "${{ inputs.migration_test_path }}" --repository "${{ github.repository }}"
+        run: python "${{ steps.script.outputs.path }}" --target "${{ steps.target.outputs.path }}" --mode synthetic-no-migration --expect-skip true --allow-not-found --migration-test-path "${{ inputs.migration_test_path }}" --repository "${{ github.repository }}"
 
       - name: Synthetic with-migration scenario (expect skip=false)
         if: ${{ !inputs.skip_synthetic_scenarios }}
-        run: python "${{ steps.script.outputs.path }}" --target "${{ inputs.target_workflow_path }}" --mode synthetic-with-migration --expect-skip false --allow-not-found --migration-test-path "${{ inputs.migration_test_path }}" --repository "${{ github.repository }}"
+        run: python "${{ steps.script.outputs.path }}" --target "${{ steps.target.outputs.path }}" --mode synthetic-with-migration --expect-skip false --allow-not-found --migration-test-path "${{ inputs.migration_test_path }}" --repository "${{ github.repository }}"
 
       - name: Real-SHA smoke test (class 2 — restricted-token live proof)
         env:
@@ -171,7 +178,7 @@ jobs:
           set -euo pipefail
           base_sha="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
           head_sha="$(git rev-parse HEAD)"
-          python "${{ steps.script.outputs.path }}" --target "${{ inputs.target_workflow_path }}" --mode real-shas \
+          python "${{ steps.script.outputs.path }}" --target "${{ steps.target.outputs.path }}" --mode real-shas \
             --base-sha "$base_sha" --head-sha "$head_sha" --allow-not-found \
             --repository "${{ github.repository }}" --github-token "$GITHUB_TOKEN"
 
