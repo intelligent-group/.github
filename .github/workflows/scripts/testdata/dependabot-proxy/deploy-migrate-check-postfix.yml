@@ -1,0 +1,96 @@
+# Self-test fixture: real content from ait-crm's deploy.yml (migrate-check
+# job, `migrate-needed` step, git-diff-style skip-check) -- the "class 5"
+# instance of the same pattern (per team-lead confirmation: same secrets-gap
+# root cause as class 1, different file -- deploy.yml's migrate-check job
+# instead of supabase-preview.yml's branch job). Fixed under PR #1857.
+# Trimmed to the relevant job only (unrelated pick/clerk-satellite-gate/
+# deploy-api/deploy-worker/deploy-web jobs removed) -- this repo's proxy
+# script only recognizes ONE pattern class per target file, so the other
+# jobs add nothing to the self-test and just bloat the fixture.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  migrate-check:
+    name: Check for unapplied migrations
+    runs-on: [self-hosted, mroot-self-hosted]
+    timeout-minutes: 10
+    steps:
+      - name: Purge stale git auth header
+        run: git config --global --unset-all http."https://github.com/".extraheader 2>/dev/null || true
+      - uses: actions/checkout@v7
+      - name: Determine whether migration check is needed
+        id: migrate-needed
+        run: |
+          # Dependabot-triggered pull_request runs only get Dependabot-scoped
+          # secrets, not regular repo secrets, so DIRECT_URL is empty and
+          # `prisma migrate status` always fails with P1000 auth error --
+          # see the 2026-07 fleet-wide dependabot-secrets-gap incident (same
+          # root cause as supabase-preview.yml's `branch` job). A pure
+          # dependency bump never touches packages/shared/prisma/, so there's
+          # no schema drift for this check to catch; skip it instead of
+          # granting a bot-triggered PR live DB creds.
+          #
+          # Uses `git diff` against a shallow-fetched base SHA rather than
+          # the GitHub API: dependabot-triggered pull_request runs get a
+          # restricted GITHUB_TOKEN that 404s on `pulls/{n}/files` on at
+          # least one sibling repo (ait-hosted-agents) -- avoid the token
+          # dependency entirely.
+          if [ "${{ github.event_name }}" != "pull_request" ] || [ "${{ github.actor }}" != "dependabot[bot]" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"; then
+            echo "::warning::could not fetch base SHA to diff — defaulting to skip=false (migration check will still run)"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! changed_files=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD); then
+            echo "::warning::git diff failed — defaulting to skip=false (migration check will still run)"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if echo "$changed_files" | grep -q '^packages/shared/prisma/'; then
+            echo "::notice::Dependabot PR touches packages/shared/prisma/ — migration check still required"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Dependabot PR with no packages/shared/prisma/ changes — skipping migration check (dependabot-triggered runs lack DIRECT_URL secret)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@v7
+        if: steps.migrate-needed.outputs.skip != 'true'
+        with:
+          node-version: '22'
+          cache: 'npm'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@intelligent-group'
+      - run: npm ci
+        if: steps.migrate-needed.outputs.skip != 'true'
+        timeout-minutes: 8
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: "true"
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN || secrets.IG_PACKAGES_TOKEN }}
+      - name: Apply pending Prisma migrations (push/dispatch) or check status (PR)
+        if: steps.migrate-needed.outputs.skip != 'true'
+        timeout-minutes: 3
+        env:
+          DATABASE_URL: ${{ secrets.DIRECT_URL }}
+          DIRECT_URL: ${{ secrets.DIRECT_URL }}
+        run: |
+          if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            npx prisma migrate deploy --config ../../prisma.config.ts
+          else
+            npx prisma migrate status --config ../../prisma.config.ts
+          fi
+        working-directory: packages/shared

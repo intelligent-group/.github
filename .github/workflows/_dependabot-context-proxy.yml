@@ -210,4 +210,27 @@ jobs:
             --base-sha "$base_sha" --head-sha "$head_sha" \
             --repository "${{ github.repository }}" --github-token "${{ secrets.GITHUB_TOKEN }}"
 
-          echo "self-test passed: class-4 pre/post fixtures correctly FAIL/PASS; both skip-check variants (git-diff, Compare-API) execute cleanly under restricted permissions: contents: read with no custom secrets"
+          # "Class 5" (team-lead confirmed 2026-07-16): ait-crm deploy.yml's
+          # migrate-check job -- same secrets-gap root cause as class 1, a
+          # different file/job (PR #1857). Real content, not synthetic. No
+          # pre-fix static-check fixture: unlike the class-4 case, this job's
+          # skip-check and all its gates shipped together in #1857 -- there's
+          # no earlier "skip-check exists but a step is ungated" state to
+          # capture. The pre-fix bug was "no skip-check existed at all, so
+          # the whole job ran unconditionally and crashed on missing
+          # DIRECT_URL" -- that's a full-job runtime failure outside this
+          # proxy's scope (it only extracts+executes the skip-check step
+          # itself, not the whole job), so it isn't asserted here rather
+          # than faked.
+          echo "--- self-test 6: deploy.yml migrate-check static gate check must PASS ---"
+          python "$script" --target "$fixtures/deploy-migrate-check-postfix.yml" --mode static-only
+
+          echo "--- self-test 7: deploy.yml migrate-check, synthetic no-migration -> skip=true ---"
+          python "$script" --target "$fixtures/deploy-migrate-check-postfix.yml" --mode synthetic-no-migration --expect-skip true \
+            --migration-test-path "packages/shared/prisma/migrations/00000000000000_dependabot_proxy_test.sql"
+
+          echo "--- self-test 8: deploy.yml migrate-check, synthetic with-migration -> skip=false ---"
+          python "$script" --target "$fixtures/deploy-migrate-check-postfix.yml" --mode synthetic-with-migration --expect-skip false \
+            --migration-test-path "packages/shared/prisma/migrations/00000000000000_dependabot_proxy_test.sql"
+
+          echo "self-test passed: class-4 pre/post fixtures correctly FAIL/PASS; all 3 real skip-check variants (git-diff x2, Compare-API) execute cleanly under restricted permissions: contents: read with no custom secrets"
