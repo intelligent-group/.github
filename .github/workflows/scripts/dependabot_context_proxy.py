@@ -274,6 +274,13 @@ def main():
             bare_dir = os.path.join(repo_dir, 'origin.git')
             work_dir = os.path.join(repo_dir, 'work')
             subprocess.run(['git', 'init', '-q', '--bare', bare_dir], check=True)
+            # Pin HEAD explicitly -- init.defaultBranch varies by git version/config
+            # (main vs master vs unset), and if the bare repo's HEAD symref ends up
+            # pointing at a branch that's never pushed, `git clone` finds nothing to
+            # check out ("You appear to have cloned an empty repository", no HEAD)
+            # regardless of which branches actually exist. Confirmed divergence
+            # between local (worked) and GitHub-hosted runner (empty clone) git.
+            subprocess.run(['git', '-C', bare_dir, 'symbolic-ref', 'HEAD', 'refs/heads/main'], check=True)
             subprocess.run(['git', 'init', '-q', '-b', 'main', work_dir], check=True)
             subprocess.run(['git', '-C', work_dir, 'config', 'user.email', 'proxy@intelligentit.io'], check=True)
             subprocess.run(['git', '-C', work_dir, 'config', 'user.name', 'dependabot-proxy'], check=True)
