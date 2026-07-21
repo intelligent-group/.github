@@ -1,0 +1,164 @@
+name: Self-Heal on Failure (reusable)
+# Universal failure handler for the IG fleet.
+# Any workflow can call this on failure to:
+#   1. Open/update a grab-work issue (fleet build loop will pick it up)
+#   2. Post to Slack #ait-alerts
+#
+# Permissions note: permissions are inherited from the caller.
+# Callers MUST set `permissions: issues: write` (or full perms) at workflow level.
+# Do NOT add job-level permissions here -- causes startup_failure in this org.
+# See memory/feedback_supabase_migration_drift_silent_prod_outage.md for context.
+#
+# Usage example (add to any workflow that should self-heal on failure):
+#
+#   on-failure-self-heal:
+#     needs: [job1, job2]        # all jobs in the workflow
+#     if: failure()
+#     uses: intelligent-group/.github/.github/workflows/_self-heal-on-failure.yml@main
+#     with:
+#       workflow_name: 'My Workflow'
+#       failure_context: 'The deploy failed. Check Cloud Run logs.'
+#       severity: 'P1'
+#       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+#     secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      workflow_name:
+        required: true
+        type: string
+        description: 'Display name of the failing workflow (shown in issue title + Slack)'
+      failure_context:
+        required: true
+        type: string
+        description: 'Markdown summary of what failed (2-5 sentences; no secrets)'
+      severity:
+        required: false
+        type: string
+        default: 'P2'
+        description: 'P0 = page now, P1 = next grab-work batch, P2 = queue'
+      repo:
+        required: false
+        type: string
+        default: ''
+        description: 'owner/repo — defaults to the calling repo'
+      run_url:
+        required: false
+        type: string
+        default: ''
+        description: 'Direct URL to the failing Actions run'
+      slack_channel:
+        required: false
+        type: string
+        default: 'C0B2215HW22'
+        description: 'Slack channel ID (default: #ait-alerts)'
+    secrets:
+      SLACK_WEBHOOK_DEV_ALERTS:
+        required: false
+
+jobs:
+  open-grab-work-issue:
+    name: 'Self-heal: open grab-work issue'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resolve repo
+        id: repo
+        run: |
+          REPO="${{ inputs.repo }}"
+          if [ -z "$REPO" ]; then
+            REPO="${{ github.repository }}"
+          fi
+          echo "repo=${REPO}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure labels exist
+        env:
+          REPO: ${{ steps.repo.outputs.repo }}
+        run: |
+          gh label create "self-heal"   --repo "${REPO}" --color "d93f0b" --description "Auto-opened by fleet self-heal loop"  2>/dev/null || true
+          gh label create "grab-work"   --repo "${REPO}" --color "0075ca" --description "Ready for fleet build loop"            2>/dev/null || true
+          gh label create "ci-failure"  --repo "${REPO}" --color "e4e669" --description "CI/CD workflow failure"                2>/dev/null || true
+
+      - name: Open or update grab-work issue
+        id: issue
+        env:
+          REPO: ${{ steps.repo.outputs.repo }}
+          WF: ${{ inputs.workflow_name }}
+          SEVERITY: ${{ inputs.severity }}
+          CONTEXT: ${{ inputs.failure_context }}
+          RUN_URL: ${{ inputs.run_url }}
+        run: |
+          TITLE="[Self-Heal] ${WF} failed"
+          NOW=$(date -u '+%Y-%m-%d %H:%M UTC')
+          RUN_LINK="${RUN_URL:-https://github.com/${REPO}/actions}"
+
+          # Dedup: find existing open issue with the same title
+          EXISTING=$(gh api "repos/${REPO}/issues" \
+            --method GET \
+            -f state=open \
+            -f labels=self-heal \
+            --jq "[.[] | select(.title == \"${TITLE}\")] | first | .number // empty" 2>/dev/null || true)
+
+          if [ -n "$EXISTING" ]; then
+            echo "Issue #${EXISTING} already open - adding recurrence comment"
+            gh api "repos/${REPO}/issues/${EXISTING}/comments" \
+              --method POST \
+              -f "body=Recurrence ${NOW}. Run: ${RUN_LINK}. Context: ${CONTEXT}" \
+              2>/dev/null || true
+            {
+              echo "issue_number=${EXISTING}"
+              echo "action=updated"
+            } >> "$GITHUB_OUTPUT"
+          else
+            TMPFILE=$(mktemp)
+            printf '%s - Workflow Failure: %s\n\nRepo: %s\nSeverity: %s\nRun: %s\nDetected: %s\n\n### What failed\n\n%s\n\n### Resolution steps\n\n1. Click the run link above and read the full error log\n2. Identify the root cause (expired secret, flaky infra, schema drift)\n3. Fix the root cause and push a change or apply a manual fix\n4. Confirm the workflow passes on re-run\n5. Close this issue\n\n---\nAuto-opened by IG fleet self-heal primitive. Grab-work fleet will pick this up.\n' \
+              "$SEVERITY" "$WF" "$REPO" "$SEVERITY" "$RUN_LINK" "$NOW" "$CONTEXT" > "$TMPFILE"
+            NEW_URL=$(gh issue create \
+              --repo "${REPO}" \
+              --title "${TITLE}" \
+              --body-file "$TMPFILE" \
+              --label "self-heal,grab-work,ci-failure" 2>/dev/null)
+            rm -f "$TMPFILE"
+            ISSUE_NUM=$(echo "${NEW_URL}" | grep -oE '[0-9]+$')
+            echo "Opened issue #${ISSUE_NUM}: ${NEW_URL}"
+            {
+              echo "issue_number=${ISSUE_NUM}"
+              echo "issue_url=${NEW_URL}"
+              echo "action=created"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Slack alert
+        env:
+          REPO: ${{ steps.repo.outputs.repo }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_DEV_ALERTS }}
+          WF: ${{ inputs.workflow_name }}
+          SEVERITY: ${{ inputs.severity }}
+          ISSUE_NUM: ${{ steps.issue.outputs.issue_number }}
+          RUN_URL: ${{ inputs.run_url }}
+        run: |
+          if [ -z "${SLACK_WEBHOOK}" ]; then
+            echo "SLACK_WEBHOOK_DEV_ALERTS not set — skipping Slack notification"
+            exit 0
+          fi
+
+          EMOJI=":warning:"
+          [ "$SEVERITY" = "P0" ] && EMOJI=":rotating_light:"
+          [ "$SEVERITY" = "P1" ] && EMOJI=":exclamation:"
+
+          ISSUE_URL="https://github.com/${REPO}/issues/${ISSUE_NUM}"
+          RUN_LINK="${RUN_URL:-https://github.com/${REPO}/actions}"
+
+          PAYLOAD=$(jq -n \
+            --arg text "${EMOJI} *${SEVERITY} CI Failure*: ${WF} in ${REPO}" \
+            --arg mrkdwn "${EMOJI} *${SEVERITY} - CI Failure*\n*Workflow:* ${WF}\n*Repo:* ${REPO}" \
+            --arg run_url "${RUN_LINK}" \
+            --arg issue_url "${ISSUE_URL}" \
+            '{text: $text, blocks: [{type:"section",text:{type:"mrkdwn",text:$mrkdwn}},{type:"actions",elements:[{type:"button",text:{type:"plain_text",text:"View Run"},url:$run_url},{type:"button",text:{type:"plain_text",text:"Grab-Work Issue"},url:$issue_url}]}]}')
+
+          curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d "${PAYLOAD}" \
+            "${SLACK_WEBHOOK}" || true
