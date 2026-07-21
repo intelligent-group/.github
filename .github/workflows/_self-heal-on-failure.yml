@@ -107,8 +107,10 @@ jobs:
               --method POST \
               -f "body=Recurrence ${NOW}. Run: ${RUN_LINK}. Context: ${CONTEXT}" \
               2>/dev/null || true
-            echo "issue_number=${EXISTING}" >> "$GITHUB_OUTPUT"
-            echo "action=updated" >> "$GITHUB_OUTPUT"
+            {
+              echo "issue_number=${EXISTING}"
+              echo "action=updated"
+            } >> "$GITHUB_OUTPUT"
           else
             TMPFILE=$(mktemp)
             printf '%s - Workflow Failure: %s\n\nRepo: %s\nSeverity: %s\nRun: %s\nDetected: %s\n\n### What failed\n\n%s\n\n### Resolution steps\n\n1. Click the run link above and read the full error log\n2. Identify the root cause (expired secret, flaky infra, schema drift)\n3. Fix the root cause and push a change or apply a manual fix\n4. Confirm the workflow passes on re-run\n5. Close this issue\n\n---\nAuto-opened by IG fleet self-heal primitive. Grab-work fleet will pick this up.\n' \
@@ -121,9 +123,11 @@ jobs:
             rm -f "$TMPFILE"
             ISSUE_NUM=$(echo "${NEW_URL}" | grep -oE '[0-9]+$')
             echo "Opened issue #${ISSUE_NUM}: ${NEW_URL}"
-            echo "issue_number=${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
-            echo "issue_url=${NEW_URL}" >> "$GITHUB_OUTPUT"
-            echo "action=created" >> "$GITHUB_OUTPUT"
+            {
+              echo "issue_number=${ISSUE_NUM}"
+              echo "issue_url=${NEW_URL}"
+              echo "action=created"
+            } >> "$GITHUB_OUTPUT"
           fi
 
       - name: Slack alert
@@ -147,28 +151,12 @@ jobs:
           ISSUE_URL="https://github.com/${REPO}/issues/${ISSUE_NUM}"
           RUN_LINK="${RUN_URL:-https://github.com/${REPO}/actions}"
 
-          PAYLOAD=$(printf '{
-            "text": "%s *%s CI Failure*: `%s` in `%s`",
-            "blocks": [
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "%s *%s — CI Failure*\n*Workflow:* `%s`\n*Repo:* `%s`"
-                }
-              },
-              {
-                "type": "actions",
-                "elements": [
-                  {"type":"button","text":{"type":"plain_text","text":"View Run"},"url":"%s"},
-                  {"type":"button","text":{"type":"plain_text","text":"Grab-Work Issue"},"url":"%s"}
-                ]
-              }
-            ]
-          }' \
-            "$EMOJI" "$SEVERITY" "$WF" "$REPO" \
-            "$EMOJI" "$SEVERITY" "$WF" "$REPO" \
-            "$RUN_LINK" "$ISSUE_URL")
+          PAYLOAD=$(jq -n \
+            --arg text "${EMOJI} *${SEVERITY} CI Failure*: ${WF} in ${REPO}" \
+            --arg mrkdwn "${EMOJI} *${SEVERITY} - CI Failure*\n*Workflow:* ${WF}\n*Repo:* ${REPO}" \
+            --arg run_url "${RUN_LINK}" \
+            --arg issue_url "${ISSUE_URL}" \
+            '{text: $text, blocks: [{type:"section",text:{type:"mrkdwn",text:$mrkdwn}},{type:"actions",elements:[{type:"button",text:{type:"plain_text",text:"View Run"},url:$run_url},{type:"button",text:{type:"plain_text",text:"Grab-Work Issue"},url:$issue_url}]}]}')
 
           curl -s -X POST \
             -H "Content-Type: application/json" \
