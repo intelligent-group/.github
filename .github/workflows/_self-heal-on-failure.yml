@@ -94,28 +94,6 @@ jobs:
           NOW=$(date -u '+%Y-%m-%d %H:%M UTC')
           RUN_LINK="${RUN_URL:-https://github.com/${REPO}/actions}"
 
-          BODY="## ${SEVERITY} — Workflow Failure: \`${WF}\`
-
-**Repo:** \`${REPO}\`
-**Severity:** ${SEVERITY}
-**Run:** ${RUN_LINK}
-**Detected:** ${NOW}
-
-### What failed
-
-${CONTEXT}
-
-### Resolution steps
-
-1. Click the run link above → read the full error log
-2. Identify the root cause (expired secret, flaky infra, schema drift, etc.)
-3. Fix the root cause and push a change or apply a manual fix
-4. Confirm the workflow passes on re-run
-5. Close this issue
-
----
-*Auto-opened by IG fleet self-heal primitive. Grab-work fleet will pick this up.*"
-
           # Dedup: find existing open issue with the same title
           EXISTING=$(gh api "repos/${REPO}/issues" \
             --method GET \
@@ -124,21 +102,23 @@ ${CONTEXT}
             --jq "[.[] | select(.title == \"${TITLE}\")] | first | .number // empty" 2>/dev/null || true)
 
           if [ -n "$EXISTING" ]; then
-            echo "Issue #${EXISTING} already open — adding recurrence comment"
+            echo "Issue #${EXISTING} already open - adding recurrence comment"
             gh api "repos/${REPO}/issues/${EXISTING}/comments" \
               --method POST \
-              -f body="**Recurrence ${NOW}**
-Run: ${RUN_LINK}
-
-${CONTEXT}" 2>/dev/null || true
+              -f "body=Recurrence ${NOW}. Run: ${RUN_LINK}. Context: ${CONTEXT}" \
+              2>/dev/null || true
             echo "issue_number=${EXISTING}" >> "$GITHUB_OUTPUT"
             echo "action=updated" >> "$GITHUB_OUTPUT"
           else
+            TMPFILE=$(mktemp)
+            printf '%s - Workflow Failure: %s\n\nRepo: %s\nSeverity: %s\nRun: %s\nDetected: %s\n\n### What failed\n\n%s\n\n### Resolution steps\n\n1. Click the run link above and read the full error log\n2. Identify the root cause (expired secret, flaky infra, schema drift)\n3. Fix the root cause and push a change or apply a manual fix\n4. Confirm the workflow passes on re-run\n5. Close this issue\n\n---\nAuto-opened by IG fleet self-heal primitive. Grab-work fleet will pick this up.\n' \
+              "$SEVERITY" "$WF" "$REPO" "$SEVERITY" "$RUN_LINK" "$NOW" "$CONTEXT" > "$TMPFILE"
             NEW_URL=$(gh issue create \
               --repo "${REPO}" \
               --title "${TITLE}" \
-              --body "${BODY}" \
+              --body-file "$TMPFILE" \
               --label "self-heal,grab-work,ci-failure" 2>/dev/null)
+            rm -f "$TMPFILE"
             ISSUE_NUM=$(echo "${NEW_URL}" | grep -oE '[0-9]+$')
             echo "Opened issue #${ISSUE_NUM}: ${NEW_URL}"
             echo "issue_number=${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
