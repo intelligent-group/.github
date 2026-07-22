@@ -163,6 +163,8 @@ jobs:
       runs_on: ${{ steps.decide.outputs.runs_on }}
       picked:  ${{ steps.decide.outputs.picked }}
     steps:
+      - uses: actions/checkout@v4
+
       - id: decide
         env:
           # Use PAT if provided (needed for administration:read on runners API).
@@ -173,12 +175,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          WEIGHT="${WEIGHT:-heavy}"
-          if [ "$WEIGHT" != "light" ] && [ "$WEIGHT" != "heavy" ]; then
-            echo "::warning::invalid weight '$WEIGHT'; defaulting to 'heavy'"
-            WEIGHT=heavy
-          fi
-          echo "weight=$WEIGHT"
 
           # Helper: query runners.  Requires a PAT with administration:read.
           # GITHUB_TOKEN cannot query this endpoint (returns 403 or empty list).
@@ -223,106 +219,19 @@ jobs:
             fi
           }
 
-          # ----- Tier 0 (light only): default to ubuntu-latest, UNLESS a
-          # recent run shows GitHub-hosted is currently unavailable -----
-          #
-          # GH Actions has no native "try runner A, fail over to runner B"
-          # for a single job -- runs-on is fixed at dispatch time, and a
-          # billing-blocked job never starts (no in-job code runs to catch
-          # and reroute). So this dispatcher approximates failover instead
-          # of doing it live: probe recent job history for the structural
-          # signature of a billing/spend block -- conclusion=failure AND
-          # runner_name=="" (never got assigned ANY runner, self-hosted or
-          # hosted -- a real check that runs and fails always has a
-          # runner_name). If that signature shows up in the last few
-          # minutes, ubuntu-latest is presumed blocked for this decision
-          # too and light jobs fail over onto the same self-hosted chain
-          # heavy already uses. Otherwise light stays on the free/cheap
-          # ubuntu-latest tier by default -- keeps trivial lint/format jobs
-          # off the scarce self-hosted pool entirely under normal operation.
-          #
-          # Limitation: can't catch the very FIRST job of a fresh billing
-          # outage (nothing to detect yet) -- only the ones after it. That
-          # converts "every check fails until a human intervenes" into
-          # "one check fails, the rest self-heal," which is the practical
-          # win available given GH Actions' actual constraints.
-          #
-          # 2026-07-22 (f): scoped the probe to head_sha=github.sha (every
-          # workflow run triggered by THIS exact commit) instead of the
-          # unscoped global-recency sample from (d) -- still unreliable.
-          # Confirmed live, twice: `pick` (part of qa-workflow-lint.yml)
-          # runs and completes in ~4s; sibling workflow FILES for the same
-          # push (guard.yml, qa-gate.yml, etc.) that would show the billing
-          # signature don't reliably reach `completed` status in the API
-          # within that window -- a genuine race, not a scoping bug. Every
-          # weight=light job Tier 0 is meant to protect stayed on
-          # ubuntu-latest and failed anyway, meaning this tier actively
-          # made the resilience problem worse (false "healthy" reads) while
-          # ALSO not delivering its cost benefit reliably. Removed Tier 0.
-          # weight=light now goes straight into the same Tier 1-4 chain as
-          # heavy: no predictive guessing, no race condition, just the
-          # real, ground-truth runner-availability query. Trade-off: light
-          # jobs now compete with heavy for the same self-hosted pool
-          # instead of defaulting to free ubuntu-latest. Given the actual
-          # goal is "don't get blocked fleet-wide" (resilience) rather than
-          # cost-optimizing GH Actions minutes, and Tier 3 already queues
-          # rather than hard-failing under contention, this is the right
-          # trade for now. A real fix for the cost side would be an
-          # async watcher that detects a billing-blocked run AFTER it
-          # actually fails (ground truth, not prediction) and reruns it
-          # forced onto self-hosted -- worth building as a follow-up if
-          # self-hosted queue depth becomes a real problem in practice, but
-          # out of scope for restoring basic fleet resilience today.
-
-          RUNNERS="$(runners_json)"
-
-          # ----- Tier 1: PC (any "pc-*" labeled runner), online + idle -----
-          # Prefix match, not the dead exact-string "pc-cpu" — see 2026-07-22(b)
-          # note above. Real labels observed: pc-ultra7-igorg, pc-ultra7-mruser, etc.
-          PC_IDLE=$(echo "$RUNNERS" | jq -r \
-            '.runners[]? | select(.status=="online" and .busy==false) | select([.labels[].name] | any(startswith("pc-"))) | .name' \
-            | head -1)
-          PC_ONLINE_COUNT=$(echo "$RUNNERS" | jq -r \
-            '[.runners[]? | select(.status=="online") | select([.labels[].name] | any(startswith("pc-")))] | length')
-
-          if [ -n "$PC_IDLE" ]; then
-            echo "::notice::Picked Tier-1 PC runner: $PC_IDLE (weight=$WEIGHT)"
-            echo 'runs_on=["self-hosted","ig-self-hosted"]' >> "$GITHUB_OUTPUT"
-            echo 'picked=pc' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # ----- Tier 2: MIG (ig-self-hosted), online + idle -----
-          MIG_IDLE=$(echo "$RUNNERS" | jq -r \
-            '.runners[]? | select(.status=="online" and .busy==false) | select([.labels[].name] | index("ig-self-hosted")) | .name' \
-            | head -1)
-          MIG_ONLINE_COUNT=$(echo "$RUNNERS" | jq -r \
-            '[.runners[]? | select(.status=="online") | select([.labels[].name] | index("ig-self-hosted"))] | length')
-
-          if [ -n "$MIG_IDLE" ]; then
-            echo "::notice::PC busy/offline + weight=$WEIGHT; picked Tier-2 MIG: $MIG_IDLE"
-            echo 'runs_on=["self-hosted","ig-self-hosted"]' >> "$GITHUB_OUTPUT"
-            echo 'picked=ig-self-hosted' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # ----- Tier 3: nothing idle, but self-hosted infra is registered
-          # and ONLINE (just fully busy) — queue there instead of bailing.
-          # See 2026-07-22(c) note above.
-          # Defense in depth: guarantee numeric even if jq ever misbehaves again.
-          PC_ONLINE_COUNT="${PC_ONLINE_COUNT:-0}"
-          MIG_ONLINE_COUNT="${MIG_ONLINE_COUNT:-0}"
-          TOTAL_ONLINE=$((PC_ONLINE_COUNT + MIG_ONLINE_COUNT))
-          if [ "$TOTAL_ONLINE" -gt 0 ]; then
-            echo "::notice::All self-hosted busy (PC online=$PC_ONLINE_COUNT, MIG online=$MIG_ONLINE_COUNT, weight=$WEIGHT) — queueing on self-hosted rather than bailing to ubuntu-latest"
-            echo 'runs_on=["self-hosted","ig-self-hosted"]' >> "$GITHUB_OUTPUT"
-            echo 'picked=ig-self-hosted-queued' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # ----- Tier 4: final fallback — ZERO self-hosted runners online at
-          # all (genuine outage, not merely busy). Only condition that should
-          # ever reach ubuntu-latest now.
-          echo "::notice::No self-hosted runners online at all (PC=$PC_ONLINE_COUNT, MIG=$MIG_ONLINE_COUNT) — final fallback to ubuntu-latest"
-          echo 'runs_on=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
-          echo 'picked=ubuntu-latest' >> "$GITHUB_OUTPUT"
+          # 2026-07-22 (h): the Tier 1-4 decision logic (previously ~130
+          # lines inline here) moved to scripts/pick-runner-decide.sh so it
+          # is unit-testable with fixture data instead of only being
+          # exercisable by real GH Actions runs. This mattered in practice:
+          # 6 independent bugs in that logic each shipped, individually
+          # tested "fixed" against live runs, and only surfaced once the
+          # PREVIOUS bug stopped masking it -- at the point the fixture eval
+          # was written, Tiers 1/2/4 had NEVER once been exercised by a real
+          # run (only Tier 3, because the org's self-hosted fleet happened
+          # to be saturated every time a live test ran). See
+          # scripts/gates/__evals__/pick-runner-decide/ for the eval suite
+          # (10 fixture-based assertions covering all 4 tiers + both known
+          # regression shapes). Behavior here is unchanged -- this step now
+          # just fetches the runners JSON (needs GH_TOKEN, must stay inline)
+          # and pipes it through.
+          runners_json | bash "${GITHUB_WORKSPACE}/scripts/pick-runner-decide.sh" >> "$GITHUB_OUTPUT"
