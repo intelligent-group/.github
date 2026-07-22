@@ -1,14 +1,94 @@
+# CANONICAL SOURCE — org-wide default. Per this repo's own description,
+# edits here propagate to any repo without a local override; repos that
+# maintain a local copy (some can't cross-repo `uses:` a private org
+# workflow) must sync from here manually until an auto-sync heartbeat
+# exists (tracked, not yet built as of 2026-07-22 — see
+# ait-claude-config's own copy header for the "repo can't uses: an org
+# private workflow" constraint that necessitates copies in the first
+# place). Fixed here 2026-07-22 after being fixed + proven live first in
+# intelligent-group/ait-claude-config PR #3766 (org-wide GH Actions
+# billing block took down every light-weight CI gate fleet-wide; root
+# causes: dead pc-cpu label, repo-scoped instead of org-scoped runner
+# query, and a "0 idle now" vs "genuinely offline" conflation that skipped
+# GitHub's native job queueing). Full history in the comments below.
 name: Pick runner
 
-# Reusable workflow that decides where to land downstream jobs based on:
-#   1. PC self-hosted runner availability (pc-cpu label) — preferred for ALL weights when online
-#   2. The job's weight (light vs heavy) — when PC is offline
+# Reusable workflow that decides where to land downstream jobs. End-to-end
+# decision tree (rewritten 2026-07-22, see history below):
 #
-# Fallback when PC is offline:
-#   - weight=light → ubuntu-latest (uses GH free tier first; cheap per-minute if over)
-#   - weight=heavy → MIG (ig-self-hosted; ~$0.01/job amortized), then ubuntu-latest if MIG also offline
+#   Tier 1 — PC online + IDLE          → route to self-hosted, prefer PC
+#   Tier 2 — PC busy, MIG online+IDLE  → route to self-hosted, prefer MIG
+#   Tier 3 — nothing idle, but PC or MIG is registered+ONLINE (just busy)
+#                                       → route to self-hosted anyway; the
+#                                         job QUEUES natively on GitHub's side
+#                                         until a runner frees up, instead of
+#                                         bailing out
+#   Tier 4 — PC AND MIG both have ZERO online runners (genuine self-hosted
+#            outage, not merely "busy")
+#                                       → ubuntu-latest (final fallback)
 #
-# Final fallback when EVERYTHING self-hosted is offline: ubuntu-latest.
+# `weight` no longer changes which tier is reachable -- light and heavy both
+# get the full Tier 1-4 chain (see 2026-07-22(f): a weight=light-only
+# "default to free ubuntu-latest, predict when it's blocked" tier was tried
+# and reverted -- the prediction was unreliable, a genuine race condition,
+# not just a scoping bug). It only affects notice/telemetry text. All
+# self-hosted tiers output the same runs_on label set
+# (["self-hosted","ig-self-hosted"]); see the 2026-07-22(b) label-bug note
+# below for why a PC-specific target label isn't used even when Tier 1 is
+# what actually matched.
+#
+# History:
+#
+# 2026-07-22 (a): light used to skip straight to ubuntu-latest ("free tier,
+# cheap") whenever PC was offline. That shortcut has a real failure mode: if
+# the org's GH Actions billing/spend limit is blocked (payment failure or
+# limit hit), ubuntu-latest is UNAVAILABLE too, and every light-weight job
+# (lint/actionlint/QA gates — the majority of checks on most PRs) fails
+# uniformly with "account payments have failed or your spending limit needs
+# to be increased," even though self-hosted capacity existed the whole time.
+# Fix: unified light onto the same fallback chain as heavy.
+#
+# 2026-07-22 (b): Tier 1's query has never actually matched anything. It
+# searched for a runner labeled exactly "pc-cpu" — no runner registered in
+# this org (post intelligent-group migration) carries that label; the real
+# ones are pc-ultra7-igorg, pc-ultra7-igorg-orglevel, pc-ultra7-mruser.
+# "PC offline" was therefore reported unconditionally regardless of the
+# actual PC's state. Fixed: match any label with prefix "pc-" instead of
+# the exact dead string.
+#
+# 2026-07-22 (c): separately, "0 idle self-hosted runners right now" was
+# treated identically to "self-hosted is down" and fell straight through to
+# ubuntu-latest. Confirmed live (2026-07-22, org-wide billing block +
+# simultaneous fleet load): all 5 registered self-hosted runners were
+# online and simply ALL busy (109 open PRs org-wide) — a real but temporary
+# saturation state, not an outage. Added Tier 3: when self-hosted infra is
+# registered+online but fully busy, route there anyway and let the job
+# queue — GitHub Actions natively waits for a runner rather than failing,
+# and self-hosted has no billing dependency, so queueing is strictly more
+# resilient than falling to a possibly-also-unavailable ubuntu-latest.
+# ubuntu-latest remains the final fallback (Tier 4) for the one case that
+# actually means "no self-hosted runner will ever pick this up": zero
+# runners registered+online across both PC and MIG. Per-job timeout-minutes
+# (set individually in each consuming workflow) bounds actual execution
+# time once a runner picks the job up; it does not start counting while a
+# job merely sits queued, so this does not risk an unbounded hang.
+#
+# 2026-07-22 (d): (c) made light unconditionally self-hosted-first, same as
+# heavy -- but that puts every trivial lint/format check into direct
+# contention with heavy build/deploy jobs for the same 5-runner self-hosted
+# pool, which is exactly the kind of pressure that produces the "all 5 busy"
+# state (c) was written to survive. Reintroduced weight-based branching as
+# Tier 0: light defaults back to free/cheap ubuntu-latest (matching the
+# ORIGINAL pre-2026-07-22 design), but now with a real failover instead of
+# a silent hard-fail -- `ubuntu_latest_blocked()` probes recent run history
+# for the structural signature of a billing block (failure + no runner ever
+# assigned) and, if found, routes light through the same Tier 1-4 chain
+# heavy uses. True mid-flight failover (retry THIS SAME job attempt on a
+# different runner after ubuntu-latest fails to start) isn't possible in
+# GH Actions -- runs-on is fixed before the job is dispatched, and a
+# billing-blocked job never starts any in-job code that could catch and
+# reroute it. This is the closest practical approximation: detect-after-
+# the-fact from a prior run, route-around for the next one.
 #
 # *** HIPAA-FUTURE-NOTE — when the first BAA client signs, restore the hard gate. ***
 # Repos listed in scripts/gates/hipaa-repos.txt must NEVER use this workflow because
@@ -19,47 +99,32 @@ name: Pick runner
 # size=1 MIG floor in Cloud Scheduler `runner-mig-scale-down-ig-org`.
 #
 # Root cause (2026-06-21): GITHUB_TOKEN in reusable workflows cannot query
-# /orgs/{org}/actions/runners — the endpoint requires `administration:read`
-# which is NOT in the GITHUB_TOKEN permission set. Even with `permissions: actions: read`
-# on the consumer, the reusable receives a heavily-restricted integration token (403
-# on GET /user).
+# /orgs/{org}/actions/runners (used since 2026-07-22(e); was the repo-scoped
+# /repos/{owner}/{repo}/actions/runners endpoint before that — see history) —
+# the endpoint requires `administration:read` which is NOT in the GITHUB_TOKEN
+# permission set. Even with `permissions: actions: read` on the consumer, the
+# reusable receives a heavily-restricted integration token (403 on GET /user).
+# Fix: pass a PAT via secrets.RUNNER_QUERY_PAT (stored in repo secrets).
+# The reusable accepts it via `secrets: runner_query_pat`. Consumers call with:
+#   secrets:
+#     runner_query_pat: ${{ secrets.RUNNER_QUERY_PAT }}
+# GSM canonical name: github__mroot2025__runner-query-pat (project: intelligent-group-ait).
 #
-# AUTH HIERARCHY (preferred → fallback):
-#   1. GitHub App installation token (zero-rotation) — activated when org secrets
-#      APP_ID + APP_PRIVATE_KEY are set AND the caller uses `secrets: inherit`.
-#      Required App permission: organization_self_hosted_runners (read).
-#      Minted fresh per-run via actions/create-github-app-token@v3.
-#   2. RUNNER_QUERY_PAT (static PAT) — legacy fallback while App is not wired.
-#      GSM canonical name: github__mroot2025__runner-query-pat (project: intelligent-group-ait).
-#   3. GITHUB_TOKEN — structural fallback; always produces empty runner list
-#      (administration:read not in scope), so all jobs land on ubuntu-latest.
-#
-# Consumer pattern (preferred — passes all org secrets including APP_ID/APP_PRIVATE_KEY):
+# Consumer pattern (non-HIPAA):
 #
 #   jobs:
 #     pick:
-#       uses: intelligent-group/.github/.github/workflows/_pick-runner.yml@main
+#       uses: ./.github/workflows/_pick-runner.yml
 #       with:
-#         weight: heavy   # "light" for lint/typecheck/format; "heavy" for build/test/e2e.
-#       secrets: inherit  # passes APP_ID + APP_PRIVATE_KEY + RUNNER_QUERY_PAT
+#         weight: light
+#       secrets:
+#         runner_query_pat: ${{ secrets.RUNNER_QUERY_PAT }}
 #     build:
 #       needs: pick
 #       runs-on: ${{ fromJSON(needs.pick.outputs.runs_on) }}
 #       steps:
-#         # REQUIRED first step whenever runs_on can resolve to a self-hosted
-#         # label ("pc-cpu" / "ig-self-hosted"): those runners are persistent
-#         # boxes, and a stale git http.extraheader left by a prior interrupted
-#         # job collides with the one actions/checkout injects here, producing
-#         # `remote: Duplicate header: "Authorization"` (HTTP 400) at checkout.
-#         # No-op on a clean box and on ubuntu-latest fallback — safe always-on.
-#         - uses: intelligent-group/.github/actions/purge-stale-git-auth@main
 #         - uses: actions/checkout@v4
 #         - run: pnpm install && pnpm test
-#
-# Legacy consumer pattern (PAT only — still works, App token not activated):
-#
-#   secrets:
-#     runner_query_pat: ${{ secrets.RUNNER_QUERY_PAT }}
 #
 # Costs ~5s of ubuntu-latest per consuming workflow run (the pick job itself).
 
@@ -73,61 +138,37 @@ on:
         default: heavy
     secrets:
       runner_query_pat:
-        description: "PAT with administration:read on this org (legacy fallback). Still works when APP_ID is not configured. Store as org/repo secret RUNNER_QUERY_PAT."
-        required: false
-      app_id:
-        description: "GitHub App ID (integer) for intelligent-group-ait-bot. When set together with app_private_key, a short-lived installation token is minted instead of using the static RUNNER_QUERY_PAT. Activate by adding APP_ID as an org secret and using `secrets: inherit` in callers."
-        required: false
-      app_private_key:
-        description: "GitHub App private key PEM for app_id. Store as org secret APP_PRIVATE_KEY."
+        description: "PAT with administration:read on this repo. GITHUB_TOKEN cannot query runners API (requires administration:read, not in token permission set). Store in repo secrets as RUNNER_QUERY_PAT."
         required: false
     outputs:
       runs_on:
         description: "JSON array of labels to feed runs-on"
         value: ${{ jobs.pick.outputs.runs_on }}
       picked:
-        description: "Human-readable tier picked: 'pc-cpu', 'ig-self-hosted', or 'ubuntu-latest'"
+        description: "Human-readable tier picked: 'pc' (idle), 'ig-self-hosted' (MIG, idle), 'ig-self-hosted-queued' (self-hosted busy but online, job will queue), or 'ubuntu-latest' (final fallback — no self-hosted runner online at all)"
         value: ${{ jobs.pick.outputs.picked }}
 
-# NOTE: do NOT add workflow-level permissions: block here. Prior bisect proved
-# that workflow-level permissions: causes startup_failure in this org's GHA config.
+# NOTE: do NOT add workflow-level permissions: block here. The prior bisect
+# (commits a0107aa + 5788b59) said only job-level triggers org's startup_failure
+# bug — that bisect was INCOMPLETE. Smoke test 2026-06-21 proved workflow-level
+# permissions: ALSO causes startup_failure in this org's GHA config.
 # Root cause is deeper: GITHUB_TOKEN structurally cannot call the runners API.
-# Solution: App installation token (preferred) or PAT (legacy) — see AUTH HIERARCHY above.
+# Solution is a PAT passed via secrets.runner_query_pat (see comment above).
 
 jobs:
   pick:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ig-self-hosted]
     timeout-minutes: 2
     outputs:
       runs_on: ${{ steps.decide.outputs.runs_on }}
       picked:  ${{ steps.decide.outputs.picked }}
     steps:
-      # ---------------------------------------------------------------------------
-      # Mint a short-lived GitHub App installation token (zero-rotation path).
-      # Only runs when APP_ID + APP_PRIVATE_KEY are available (org secrets passed
-      # via `secrets: inherit` in the calling workflow).
-      # Required App permission: organization_self_hosted_runners (read).
-      # When skipped, decide step falls back to runner_query_pat (legacy PAT).
-      # ---------------------------------------------------------------------------
-      - id: mint-runner-token
-        name: Mint GitHub App runner-query token
-        # `secrets` context is NOT allowed in step `if:` conditions (GHA + actionlint).
-        # Use continue-on-error instead: the step fails softly when APP_ID is not set
-        # (create-github-app-token requires a valid app-id), and the three-tier token
-        # fallback in the `decide` step picks up runner_query_pat or GITHUB_TOKEN.
-        continue-on-error: true
-        uses: actions/create-github-app-token@v3
-        with:
-          app-id: ${{ secrets.app_id }}
-          private-key: ${{ secrets.app_private_key }}
-          owner: ${{ github.repository_owner }}
-
       - id: decide
         env:
-          # Token priority: App installation token → legacy PAT → GITHUB_TOKEN (403 fallback).
-          # App token is used when APP_ID + APP_PRIVATE_KEY are set (zero-rotation).
-          # RUNNER_QUERY_PAT remains fully functional as fallback during migration.
-          GH_TOKEN: ${{ steps.mint-runner-token.outputs.token || secrets.runner_query_pat || secrets.GITHUB_TOKEN }}
+          # Use PAT if provided (needed for administration:read on runners API).
+          # Falls back to GITHUB_TOKEN which will always produce empty runner list,
+          # causing all jobs to land on ubuntu-latest.
+          GH_TOKEN: ${{ secrets.runner_query_pat || secrets.GITHUB_TOKEN }}
           WEIGHT:   ${{ inputs.weight }}
         shell: bash
         run: |
@@ -139,59 +180,127 @@ jobs:
           fi
           echo "weight=$WEIGHT"
 
-          # Helper: query runners. Requires a PAT with administration:read.
+          # Helper: query runners.  Requires a PAT with administration:read.
           # GITHUB_TOKEN cannot query this endpoint (returns 403 or empty list).
-          # Primary: org-level runners (visible to all org repos).
-          # Secondary: repo-level runners (repo-registered runners only visible here).
-          # Results are merged and deduplicated by runner ID before selection.
-          ORG="${{ github.repository_owner }}"
           REPO="${{ github.repository }}"
+          ORG="${REPO%%/*}"
 
+          # 2026-07-22 (e): this queried repos/${REPO}/actions/runners (repo-
+          # scoped) and always got total_count=0, even confirmed live with a
+          # correctly-scoped PAT -- because the 5 runners this org actually
+          # has (pc-ultra7-*, gh-aitbms-mig-*) are registered at the ORG
+          # level, not the repo level. The repo-scoped runners endpoint does
+          # not surface org-level runners regardless of runner-group
+          # membership. Every prior tier (1-4) was therefore always seeing
+          # an empty runner list and falling straight to ubuntu-latest,
+          # independent of (a)/(b)/(c)/(d) above -- confirmed by pick's own
+          # notice output: "No self-hosted runners online at all (PC=0,
+          # MIG=0)" immediately after (d) correctly detected the billing
+          # block and tried to fail over. Fixed: query orgs/${ORG}/actions/
+          # runners instead. Verified the RUNNER_QUERY_PAT already has
+          # sufficient scope for this (org-level query returned real data
+          # directly, same PAT, outside this workflow).
           runners_json() {
-            local org_runners repo_runners
-            # Harden: || only fires on non-zero exit; empty stdout still leaves var empty.
-            # Explicit empty-check ensures fallback JSON even on silent 204/empty responses.
-            org_runners=$(gh api "orgs/${ORG}/actions/runners?per_page=100" 2>/dev/null)
-            [ -z "$org_runners" ] && org_runners='{"runners":[]}'
-            repo_runners=$(gh api "repos/${REPO}/actions/runners?per_page=100" 2>/dev/null)
-            [ -z "$repo_runners" ] && repo_runners='{"runners":[]}'
-            # Merge + dedupe by runner .id; org runners take precedence.
-            # Null-safe: // {} and // [] guard against either API returning non-JSON.
-            printf '%s\n%s' "$org_runners" "$repo_runners" \
-              | jq -s '[ ((.[0] // {}).runners // [])[], ((.[1] // {}).runners // [])[] ] | unique_by(.id)'
+            gh api "orgs/${ORG}/actions/runners?per_page=100" 2>/dev/null || echo '{"runners":[]}'
           }
 
-          # ----- Tier 1: PC self-hosted (always preferred when online+idle) -----
-          PICK_PC=$(runners_json | \
-            jq -r '.[]? | select((.status=="online") and (.busy==false) and ([.labels[].name] | index("pc-cpu"))) | .name' \
+          # ----- Tier 0 (light only): default to ubuntu-latest, UNLESS a
+          # recent run shows GitHub-hosted is currently unavailable -----
+          #
+          # GH Actions has no native "try runner A, fail over to runner B"
+          # for a single job -- runs-on is fixed at dispatch time, and a
+          # billing-blocked job never starts (no in-job code runs to catch
+          # and reroute). So this dispatcher approximates failover instead
+          # of doing it live: probe recent job history for the structural
+          # signature of a billing/spend block -- conclusion=failure AND
+          # runner_name=="" (never got assigned ANY runner, self-hosted or
+          # hosted -- a real check that runs and fails always has a
+          # runner_name). If that signature shows up in the last few
+          # minutes, ubuntu-latest is presumed blocked for this decision
+          # too and light jobs fail over onto the same self-hosted chain
+          # heavy already uses. Otherwise light stays on the free/cheap
+          # ubuntu-latest tier by default -- keeps trivial lint/format jobs
+          # off the scarce self-hosted pool entirely under normal operation.
+          #
+          # Limitation: can't catch the very FIRST job of a fresh billing
+          # outage (nothing to detect yet) -- only the ones after it. That
+          # converts "every check fails until a human intervenes" into
+          # "one check fails, the rest self-heal," which is the practical
+          # win available given GH Actions' actual constraints.
+          #
+          # 2026-07-22 (f): scoped the probe to head_sha=github.sha (every
+          # workflow run triggered by THIS exact commit) instead of the
+          # unscoped global-recency sample from (d) -- still unreliable.
+          # Confirmed live, twice: `pick` (part of qa-workflow-lint.yml)
+          # runs and completes in ~4s; sibling workflow FILES for the same
+          # push (guard.yml, qa-gate.yml, etc.) that would show the billing
+          # signature don't reliably reach `completed` status in the API
+          # within that window -- a genuine race, not a scoping bug. Every
+          # weight=light job Tier 0 is meant to protect stayed on
+          # ubuntu-latest and failed anyway, meaning this tier actively
+          # made the resilience problem worse (false "healthy" reads) while
+          # ALSO not delivering its cost benefit reliably. Removed Tier 0.
+          # weight=light now goes straight into the same Tier 1-4 chain as
+          # heavy: no predictive guessing, no race condition, just the
+          # real, ground-truth runner-availability query. Trade-off: light
+          # jobs now compete with heavy for the same self-hosted pool
+          # instead of defaulting to free ubuntu-latest. Given the actual
+          # goal is "don't get blocked fleet-wide" (resilience) rather than
+          # cost-optimizing GH Actions minutes, and Tier 3 already queues
+          # rather than hard-failing under contention, this is the right
+          # trade for now. A real fix for the cost side would be an
+          # async watcher that detects a billing-blocked run AFTER it
+          # actually fails (ground truth, not prediction) and reruns it
+          # forced onto self-hosted -- worth building as a follow-up if
+          # self-hosted queue depth becomes a real problem in practice, but
+          # out of scope for restoring basic fleet resilience today.
+
+          RUNNERS="$(runners_json)"
+
+          # ----- Tier 1: PC (any "pc-*" labeled runner), online + idle -----
+          # Prefix match, not the dead exact-string "pc-cpu" — see 2026-07-22(b)
+          # note above. Real labels observed: pc-ultra7-igorg, pc-ultra7-mruser, etc.
+          PC_IDLE=$(echo "$RUNNERS" | jq -r \
+            '.runners[]? | select(.status=="online" and .busy==false) | select([.labels[].name] | any(startswith("pc-"))) | .name' \
             | head -1)
-          if [ -n "$PICK_PC" ]; then
-            echo "::notice::Picked Tier-1 PC runner: $PICK_PC (weight=$WEIGHT)"
-            echo 'runs_on=["self-hosted","pc-cpu"]' >> "$GITHUB_OUTPUT"
-            echo 'picked=pc-cpu' >> "$GITHUB_OUTPUT"
+          PC_ONLINE_COUNT=$(echo "$RUNNERS" | jq -r \
+            '[.runners[]? | select(.status=="online") | select([.labels[].name] | any(startswith("pc-")))] | length')
+
+          if [ -n "$PC_IDLE" ]; then
+            echo "::notice::Picked Tier-1 PC runner: $PC_IDLE (weight=$WEIGHT)"
+            echo 'runs_on=["self-hosted","ig-self-hosted"]' >> "$GITHUB_OUTPUT"
+            echo 'picked=pc' >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # ----- PC offline: branch by weight -----
-          if [ "$WEIGHT" = "light" ]; then
-            # Light tasks → ubuntu-latest first (GH free tier 3000min/mo on private repos)
-            echo "::notice::PC offline + weight=light; routing to ubuntu-latest (cheap)"
-            echo 'runs_on=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
-            echo 'picked=ubuntu-latest' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # weight=heavy: try MIG (cheaper per-job for sustained load), else ubuntu-latest
-          PICK_MIG=$(runners_json | \
-            jq -r '.[]? | select((.status=="online") and (.busy==false) and ([.labels[].name] | index("ig-self-hosted"))) | .name' \
+          # ----- Tier 2: MIG (ig-self-hosted), online + idle -----
+          MIG_IDLE=$(echo "$RUNNERS" | jq -r \
+            '.runners[]? | select(.status=="online" and .busy==false) | select([.labels[].name] | index("ig-self-hosted")) | .name' \
             | head -1)
-          if [ -n "$PICK_MIG" ]; then
-            echo "::notice::PC offline + weight=heavy; picked Tier-2 MIG: $PICK_MIG"
+          MIG_ONLINE_COUNT=$(echo "$RUNNERS" | jq -r \
+            '[.runners[]? | select(.status=="online") | select([.labels[].name] | index("ig-self-hosted"))] | length')
+
+          if [ -n "$MIG_IDLE" ]; then
+            echo "::notice::PC busy/offline + weight=$WEIGHT; picked Tier-2 MIG: $MIG_IDLE"
             echo 'runs_on=["self-hosted","ig-self-hosted"]' >> "$GITHUB_OUTPUT"
             echo 'picked=ig-self-hosted' >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "::notice::PC offline + MIG offline; final fallback to ubuntu-latest"
+          # ----- Tier 3: nothing idle, but self-hosted infra is registered
+          # and ONLINE (just fully busy) — queue there instead of bailing.
+          # See 2026-07-22(c) note above.
+          TOTAL_ONLINE=$((PC_ONLINE_COUNT + MIG_ONLINE_COUNT))
+          if [ "$TOTAL_ONLINE" -gt 0 ]; then
+            echo "::notice::All self-hosted busy (PC online=$PC_ONLINE_COUNT, MIG online=$MIG_ONLINE_COUNT, weight=$WEIGHT) — queueing on self-hosted rather than bailing to ubuntu-latest"
+            echo 'runs_on=["self-hosted","ig-self-hosted"]' >> "$GITHUB_OUTPUT"
+            echo 'picked=ig-self-hosted-queued' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ----- Tier 4: final fallback — ZERO self-hosted runners online at
+          # all (genuine outage, not merely busy). Only condition that should
+          # ever reach ubuntu-latest now.
+          echo "::notice::No self-hosted runners online at all (PC=$PC_ONLINE_COUNT, MIG=$MIG_ONLINE_COUNT) — final fallback to ubuntu-latest"
           echo 'runs_on=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
           echo 'picked=ubuntu-latest' >> "$GITHUB_OUTPUT"
