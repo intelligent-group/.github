@@ -27,9 +27,20 @@ permissions:
   contents: read
 
 jobs:
+  # Billing-block fix (2026-07-22): direct top-level workflow (push/pull_request
+  # on this repo), so secrets.RUNNER_QUERY_PAT resolves straight to this repo's
+  # own Actions secret — no passthrough plumbing needed here.
+  pick:
+    uses: ./.github/workflows/_pick-runner.yml
+    with:
+      weight: light
+    secrets:
+      runner_query_pat: ${{ secrets.RUNNER_QUERY_PAT }}
+
   actionlint:
     name: actionlint — reusable workflows
-    runs-on: ubuntu-latest
+    needs: [pick]
+    runs-on: ${{ fromJSON(needs.pick.outputs.runs_on) }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4

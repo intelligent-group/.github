@@ -25,6 +25,15 @@ on:
         required: false
         type: boolean
         default: false
+    secrets:
+      RUNNER_QUERY_PAT:
+        description: >
+          Optional passthrough for _pick-runner.yml's runner-availability query
+          (org-level administration:read PAT). Not required — omitting it just
+          means this gate's own `pick` job falls back to ubuntu-latest same as
+          before. Callers can wire it with `secrets: RUNNER_QUERY_PAT: ${{ secrets.RUNNER_QUERY_PAT }}`
+          or `secrets: inherit`.
+        required: false
   # Self-test on changes to the gate itself, so the linter can't rot silently.
   push:
     paths:
@@ -39,9 +48,25 @@ permissions:
   contents: read
 
 jobs:
+  # Billing-block fix (2026-07-22): this job used to hardcode ubuntu-latest,
+  # so it died in 0-3s with the account-payments/spend-limit annotation
+  # whenever the org's GitHub-hosted billing was blocked, independent of
+  # what any consumer repo did. Routed through the shared _pick-runner.yml
+  # dispatcher instead — same-repo relative `uses:` since this workflow
+  # lives in the .github repo alongside _pick-runner.yml. See that file's
+  # header comment for the full tier fallback chain and for why the
+  # relative-path form is required for a same-repo reusable-calling-reusable.
+  pick:
+    uses: ./.github/workflows/_pick-runner.yml
+    with:
+      weight: light
+    secrets:
+      runner_query_pat: ${{ secrets.RUNNER_QUERY_PAT }}
+
   lint:
     name: npm-ci hang gate
-    runs-on: ubuntu-latest
+    needs: [pick]
+    runs-on: ${{ fromJSON(needs.pick.outputs.runs_on) }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
