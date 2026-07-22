@@ -155,6 +155,10 @@ on:
 # Root cause is deeper: GITHUB_TOKEN structurally cannot call the runners API.
 # Solution is a PAT passed via secrets.runner_query_pat (see comment above).
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   pick:
     runs-on: [self-hosted, ig-self-hosted]

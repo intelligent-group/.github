@@ -57,10 +57,15 @@ on:
       SLACK_WEBHOOK_DEV_ALERTS:
         required: false
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   open-grab-work-issue:
     name: 'Self-heal: open grab-work issue'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
