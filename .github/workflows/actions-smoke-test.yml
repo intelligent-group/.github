@@ -45,6 +45,13 @@ permissions:
 jobs:
   assert-runner-clis-smoke:
     name: "Smoke: assert-runner-clis"
+    # This job specifically asserts "gh + node ship on every GitHub-hosted
+    # runner" (see step comment below) — that is a guarantee about
+    # ubuntu-latest itself, not something self-hosted routing can validate.
+    # Left un-routed deliberately (2026-07-22 billing-block sweep); this
+    # workflow is path-filtered to actions/** changes only, so its billing
+    # exposure is low-frequency by design.
+    # runner-policy-ok: asserts a GitHub-hosted-runner-specific CLI guarantee; self-hosted can't validate it
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
