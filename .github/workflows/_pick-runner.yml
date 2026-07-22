@@ -200,8 +200,27 @@ jobs:
           # runners instead. Verified the RUNNER_QUERY_PAT already has
           # sufficient scope for this (org-level query returned real data
           # directly, same PAT, outside this workflow).
+          # 2026-07-22 (g): gh api writes its error body to STDOUT (not just
+          # stderr) on failure -- `2>/dev/null || echo fallback` therefore did
+          # NOT suppress a failed call's output; on any auth/API failure the
+          # error JSON and the fallback JSON both landed in $RUNNERS, jq
+          # processed them as two separate documents, and every downstream
+          # count came out as "0\n0" instead of "0" -- crashing
+          # $((PC_ONLINE_COUNT + MIG_ONLINE_COUNT)) with an arithmetic syntax
+          # error / unbound-variable failure. Root cause was masked until
+          # today because every prior live test hit the org-wide billing
+          # block first (Tier 4 unconditionally, before this code path's
+          # own bugs could surface) or a corrupted RUNNER_QUERY_PAT (trailing
+          # whitespace broke the Authorization header, same failure mode).
+          # Fixed: capture stdout into a variable and only emit it on success;
+          # only the fallback prints on failure, never both.
           runners_json() {
-            gh api "orgs/${ORG}/actions/runners?per_page=100" 2>/dev/null || echo '{"runners":[]}'
+            local out
+            if out="$(gh api "orgs/${ORG}/actions/runners?per_page=100" 2>/dev/null)"; then
+              echo "$out"
+            else
+              echo '{"runners":[]}'
+            fi
           }
 
           # ----- Tier 0 (light only): default to ubuntu-latest, UNLESS a
@@ -290,6 +309,9 @@ jobs:
           # ----- Tier 3: nothing idle, but self-hosted infra is registered
           # and ONLINE (just fully busy) — queue there instead of bailing.
           # See 2026-07-22(c) note above.
+          # Defense in depth: guarantee numeric even if jq ever misbehaves again.
+          PC_ONLINE_COUNT="${PC_ONLINE_COUNT:-0}"
+          MIG_ONLINE_COUNT="${MIG_ONLINE_COUNT:-0}"
           TOTAL_ONLINE=$((PC_ONLINE_COUNT + MIG_ONLINE_COUNT))
           if [ "$TOTAL_ONLINE" -gt 0 ]; then
             echo "::notice::All self-hosted busy (PC online=$PC_ONLINE_COUNT, MIG online=$MIG_ONLINE_COUNT, weight=$WEIGHT) — queueing on self-hosted rather than bailing to ubuntu-latest"
