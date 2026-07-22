@@ -1,0 +1,84 @@
+name: Check runner policy
+
+# Reusable workflow — fails if any workflow in the CALLING repo hardcodes
+# `runs-on: ubuntu-latest` (paid, metered) without a documented exception.
+#
+# Root cause this closes (2026-07-22): helix shipped 12 workflow files 100%
+# on ubuntu-latest from day one (0 self-hosted), and ait-crm had 7 cron-
+# scheduled workflows on ubuntu-latest with no exemption — both silently
+# violating the org's self-hosted-by-default policy for weeks, confirmed via
+# real GitHub Actions billing data (ait-crm's July daily spend rate was 4.4x
+# June's). The policy existed in CLAUDE.md the whole time; nothing enforced
+# it, so new repos drifted from it by default. This gate is the enforcement.
+#
+# Allowed exceptions (do not fail the gate):
+#   1. CodeQL/SAST jobs — detected via `github/codeql-action` anywhere in the file.
+#   2. A line with an inline justification marker: `# runner-policy-ok: <reason>`
+#      on the same line as `runs-on: ubuntu-latest` or the line directly above it.
+#   3. Any job that calls the org's dynamic runner picker
+#      (`uses: intelligent-group/.github/.github/workflows/_pick-runner.yml`)
+#      instead of a static `runs-on:` — that workflow already has its own
+#      documented, deliberate ubuntu-latest fallback tier and is exempt by
+#      construction (nothing to statically flag — no `runs-on: ubuntu-latest`
+#      line exists in a caller that uses it).
+#
+# Consumer pattern — add this job to your repo's existing CI/lint workflow:
+#
+#   jobs:
+#     runner-policy:
+#       uses: intelligent-group/.github/.github/workflows/_check-runner-policy.yml@main
+#
+# New-repo scaffolding: this job should be added to every new repo's initial
+# CI setup by default (see stack-bootstrap skill) — not opt-in.
+
+on:
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: No un-justified ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan workflows for un-justified ubuntu-latest
+        shell: bash
+        run: |
+          set -euo pipefail
+          VIOLATIONS=0
+
+          for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+            [ -f "$f" ] || continue
+
+            # Exception 1: CodeQL/SAST files are exempt outright.
+            if grep -q "github/codeql-action" "$f"; then
+              continue
+            fi
+
+            # Scan each ubuntu-latest runs-on line individually so the
+            # justification marker can be scoped per-line, not per-file.
+            while IFS=: read -r lineno content; do
+              # Exception 2: inline or line-above justification marker.
+              if echo "$content" | grep -q "runner-policy-ok:"; then
+                continue
+              fi
+              prevline=$(sed -n "$((lineno - 1))p" "$f" 2>/dev/null || true)
+              if echo "$prevline" | grep -q "runner-policy-ok:"; then
+                continue
+              fi
+
+              echo "::error file=$f,line=$lineno::Un-justified 'runs-on: ubuntu-latest' — org policy defaults to self-hosted runners (label: mroot-self-hosted / ig-self-hosted). Either move this job to self-hosted, route it through _pick-runner.yml, or add '# runner-policy-ok: <reason>' on this line or the line above if ubuntu-latest is genuinely required (e.g. CodeQL, a multi-OS matrix)."
+              VIOLATIONS=$((VIOLATIONS + 1))
+            done < <(grep -n "runs-on:.*ubuntu-latest" "$f" || true)
+          done
+
+          if [ "$VIOLATIONS" -gt 0 ]; then
+            echo ""
+            echo "$VIOLATIONS un-justified ubuntu-latest usage(s) found. See annotations above."
+            exit 1
+          fi
+          echo "No un-justified ubuntu-latest usage found."
