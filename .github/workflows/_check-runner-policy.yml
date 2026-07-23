@@ -13,8 +13,17 @@ name: Check runner policy
 #
 # Allowed exceptions (do not fail the gate):
 #   1. CodeQL/SAST jobs — detected via `github/codeql-action` anywhere in the file.
-#   2. A line with an inline justification marker: `# runner-policy-ok: <reason>`
-#      on the same line as `runs-on: ubuntu-latest` or the line directly above it.
+#   2. A justification marker — either `# runner-policy-ok: <reason>` or
+#      `# WAIVER: <reason>` (ait-claude-config's own pre-existing convention,
+#      checked by its scripts/lint-workflow-runs-on.sh) — anywhere in the
+#      UNBROKEN comment block directly above `runs-on:` (any length; a blank
+#      or non-comment line breaks the block). Found 2026-07-22: a fixed
+#      "same line or one line above" check misses this repo's normal style
+#      of 5-6 line waiver rationales, which would have false-flagged 3
+#      already-correct ait-claude-config deploy workflows had this gate been
+#      wired in as originally written — see
+#      ait-claude-config/memory/feedback_ubuntu_latest_no_enforcement_gate.md
+#      and feedback_lint_waiver_detection_needs_unbroken_block_not_fixed_window.md.
 #   3. Any job that calls the org's dynamic runner picker
 #      (`uses: intelligent-group/.github/.github/workflows/_pick-runner.yml`)
 #      instead of a static `runs-on:` — that workflow already has its own
@@ -62,16 +71,32 @@ jobs:
             # Scan each ubuntu-latest runs-on line individually so the
             # justification marker can be scoped per-line, not per-file.
             while IFS=: read -r lineno content; do
-              # Exception 2: inline or line-above justification marker.
-              if echo "$content" | grep -q "runner-policy-ok:"; then
-                continue
-              fi
-              prevline=$(sed -n "$((lineno - 1))p" "$f" 2>/dev/null || true)
-              if echo "$prevline" | grep -q "runner-policy-ok:"; then
+              # Exception 2a: inline justification marker on the runs-on line itself.
+              if echo "$content" | grep -qE "runner-policy-ok:|# WAIVER:"; then
                 continue
               fi
 
-              echo "::error file=$f,line=$lineno::Un-justified 'runs-on: ubuntu-latest' — org policy defaults to self-hosted runners (label: mroot-self-hosted / ig-self-hosted). Either move this job to self-hosted, route it through _pick-runner.yml, or add '# runner-policy-ok: <reason>' on this line or the line above if ubuntu-latest is genuinely required (e.g. CodeQL, a multi-OS matrix)."
+              # Exception 2b: either marker anywhere in the UNBROKEN comment
+              # block immediately above (any length — walk upward while each
+              # line is a comment; a blank or code line stops the walk).
+              waived=0
+              check_line=$((lineno - 1))
+              while [ "$check_line" -ge 1 ]; do
+                line_text=$(sed -n "${check_line}p" "$f" 2>/dev/null || true)
+                if ! echo "$line_text" | grep -qE '^[[:space:]]*#'; then
+                  break
+                fi
+                if echo "$line_text" | grep -qE "runner-policy-ok:|# WAIVER:"; then
+                  waived=1
+                  break
+                fi
+                check_line=$((check_line - 1))
+              done
+              if [ "$waived" -eq 1 ]; then
+                continue
+              fi
+
+              echo "::error file=$f,line=$lineno::Un-justified 'runs-on: ubuntu-latest' — org policy defaults to self-hosted runners (label: mroot-self-hosted / ig-self-hosted). Either move this job to self-hosted, route it through _pick-runner.yml, or add '# runner-policy-ok: <reason>' or '# WAIVER: <reason>' anywhere in the comment block directly above this line if ubuntu-latest is genuinely required (e.g. CodeQL, a multi-OS matrix, no-Docker-on-self-hosted)."
               VIOLATIONS=$((VIOLATIONS + 1))
             done < <(grep -n "runs-on:.*ubuntu-latest" "$f" || true)
           done
