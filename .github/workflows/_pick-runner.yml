@@ -210,11 +210,25 @@ jobs:
           # whitespace broke the Authorization header, same failure mode).
           # Fixed: capture stdout into a variable and only emit it on success;
           # only the fallback prints on failure, never both.
+          # 2026-07-23 (i): this used `gh api` -- but the MIG startup script
+          # never installs the gh CLI (only curl/jq/git/node/python), so any
+          # pick job that landed on a MIG instance had `gh: command not
+          # found` swallowed by 2>/dev/null and fell through to the empty
+          # fallback -> "PC=0, MIG=0" -> ubuntu-latest -> billing wall.
+          # Picks landing on the WSL runners (gh installed) worked, which is
+          # why the failure looked intermittent per-repo. Fixed: query with
+          # curl (present on every runner flavor) and emit a loud notice
+          # distinguishing a FAILED query from a genuinely empty fleet, so
+          # this class of silent-empty can never masquerade as "no runners".
           runners_json() {
             local out
-            if out="$(gh api "orgs/${ORG}/actions/runners?per_page=100" 2>/dev/null)"; then
+            if out="$(curl -sf --connect-timeout 10 --max-time 30 --retry 2 \
+                -H "Authorization: token ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/orgs/${ORG}/actions/runners?per_page=100")"; then
               echo "$out"
             else
+              echo "::notice::runner query FAILED (curl exit) -- treating as empty list; check RUNNER_QUERY_PAT scope/value" >&2
               echo '{"runners":[]}'
             fi
           }
