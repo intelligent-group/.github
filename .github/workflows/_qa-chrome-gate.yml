@@ -94,6 +94,13 @@ jobs:
       CLERK_TEST_USER_EMAIL: ${{ secrets.CLERK_TEST_USER_EMAIL }}
       CLERK_TEST_USER_PASSWORD: ${{ secrets.CLERK_TEST_USER_PASSWORD }}
       CI: 'true'
+      # Self-hosted runners are persistent and can have multiple OS-user
+      # runner installs on the same box; a fixed /tmp/pw-stdout.txt name can
+      # collide across them under concurrent jobs. Scope to runner.temp
+      # (per-runner-install) + run_id (per-run) instead. Job-level so both
+      # the "Run Chrome tests" (writer) and "Parse test results" (reader)
+      # steps see the same path.
+      PW_STDOUT_FILE: ${{ runner.temp }}/pw-stdout-${{ github.run_id }}.txt
 
     steps:
       - name: Reset persistent-runner git auth (pre-checkout)
@@ -280,7 +287,7 @@ jobs:
           set +e
           ${{ inputs.playwright_command }} \
             --output=test-results \
-            2>&1 | tee /tmp/pw-stdout.txt
+            2>&1 | tee "$PW_STDOUT_FILE"
           EXIT_CODE=$?
           set -e
           END_MS=$(date +%s%3N)
@@ -314,7 +321,7 @@ jobs:
             echo "tests_total=$TOTAL"
           } >> "$GITHUB_OUTPUT"
           # Capture first error line for summary
-          ERROR=$(grep -m1 'Error\|failed\|âœ˜' /tmp/pw-stdout.txt 2>/dev/null | head -c 200 || echo '')
+          ERROR=$(grep -m1 'Error\|failed\|âœ˜' "$PW_STDOUT_FILE" 2>/dev/null | head -c 200 || echo '')
           {
             echo "error_summary<<EOF"
             echo "$ERROR"

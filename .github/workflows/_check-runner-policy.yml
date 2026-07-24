@@ -41,15 +41,35 @@ name: Check runner policy
 # CI setup by default (see stack-bootstrap skill) — not opt-in.
 
 on:
-  workflow_call: {}
+  workflow_call:
+    secrets:
+      RUNNER_QUERY_PAT:
+        description: >
+          Optional passthrough for _pick-runner.yml's runner-availability query.
+          Not required — omitting it just means this gate's own `pick` job
+          falls back to ubuntu-latest same as before.
+        required: false
 
 permissions:
   contents: read
 
 jobs:
+  # Billing-block fix (2026-07-22): this job used to hardcode ubuntu-latest
+  # itself — ironic for the workflow that polices other repos' un-justified
+  # ubuntu-latest usage. Routed through the shared _pick-runner.yml
+  # dispatcher (same-repo relative uses:); this also keeps the job exempt
+  # by construction under this file's own Exception 3 rule below.
+  pick:
+    uses: ./.github/workflows/_pick-runner.yml
+    with:
+      weight: light
+    secrets:
+      runner_query_pat: ${{ secrets.RUNNER_QUERY_PAT }}
+
   check:
     name: No un-justified ubuntu-latest
-    runs-on: ubuntu-latest
+    needs: [pick]
+    runs-on: ${{ fromJSON(needs.pick.outputs.runs_on) }}
     timeout-minutes: 2
     steps:
       - uses: actions/checkout@v4
