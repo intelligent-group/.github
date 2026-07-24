@@ -1,0 +1,421 @@
+name: Product Learning Loop (reusable)
+
+# Closes the product-level failure -> metabolize gap (research E1/Q1: "self-
+# improving operator, not self-improving products"). Existing per-repo loops
+# (e.g. ait-crm's own learning-loop.yml) already mine CI failures into LOCAL
+# .claude/memory/bug-patterns.md + guardrails.md via scripts/ingest-failure.ts
+# -- that path stays as-is and is NOT replaced here. What is missing fleet-
+# wide is a write-back into the CENTRAL ait-kb knowledge base so a lesson
+# captured in one product repo is retrievable by every other repo/agent via
+# kb_search / scripts/kb-lessons-for-task.py. This workflow adds that central
+# sink. Local-memory ingestion and this KB sink are complementary, not
+# competing -- consolidating them into one pipeline is a follow-up, not done
+# here (see PR body).
+#
+# Runner: ubuntu-latest. This job is stateless (no repo checkout of product
+# code, no local filesystem dependency) -- stateless CI jobs belong on
+# ubuntu-latest per memory/feedback_stateless_ci_jobs_belong_on_ubuntu_latest.md.
+# Self-hosted fleet is also under a billing hold at time of writing.
+#
+# Fail-OPEN by design: every external call (ait-ai-gateway draft, GCP/GSM
+# auth, KB API POST) is best-effort. A failure anywhere in the enrichment
+# chain degrades to a plainer artifact -- it must never fail this job or
+# block the pipeline that called it. The GitHub issue is the durable sink of
+# last resort and is always opened (or updated), regardless of how much of
+# the enrichment succeeded.
+#
+# Model choice (draft_model default = gemini-2.5-flash, NOT deepseek-chat):
+# CLAUDE.md's general cost-tier default for doc-drafting is deepseek-chat via
+# ait-ai-gateway. That default is overridden here because ait-crm -- the
+# first caller of this workflow -- is a PII-handling service under the M4
+# DLP governance gate (ait-ai-gateway/scripts/mint-virtual-keys.sh), whose
+# live virtual key had deepseek-chat/deepseek-reasoner/glm-* explicitly
+# REMOVED from its allowlist (China-hosted providers, org policy). Calling
+# deepseek-chat through ait-crm's key would 403. gemini-2.5-flash is on
+# every PII-service allowlist seen (ait-crm, ait-soc-sentinel, ait-bms,
+# ait-trust-portal, ait-voice-concierge) and is cheap. Non-PII callers may
+# override `draft_model: deepseek-chat` explicitly if their own virtual key
+# allows it.
+#
+# Caller requirements (mirrors the convention in
+# intelligent-group/.github/.github/workflows/_self-heal-on-failure.yml --
+# permissions are inherited from the caller job; do NOT add a job-level
+# `permissions:` block in THIS file, it causes startup_failure in this org):
+#
+#   learn:
+#     if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+#     permissions:
+#       contents: read
+#       actions: read      # gh run view --log-failed on the failed run
+#       issues: write       # open/update the learning-loop issue
+#       id-token: write     # WIF -> GSM, only used if GCP secrets are set
+#     uses: intelligent-group/.github/.github/workflows/product-learning-loop.yml@main
+#     with:
+#       workflow_name: ${{ github.event.workflow_run.name }}
+#       run_id: ${{ github.event.workflow_run.id }}
+#       run_url: ${{ github.event.workflow_run.html_url }}
+#       head_sha: ${{ github.event.workflow_run.head_sha }}
+#     secrets: inherit
+#
+# NOTE: this workflow will not resolve via `uses:` until this PR is merged to
+# main on intelligent-group/.github -- merge that PR BEFORE merging any
+# caller PR (see ait-crm's on-failure-learn.yml PR body).
+
+on:
+  workflow_call:
+    inputs:
+      workflow_name:
+        required: true
+        type: string
+        description: 'Display name of the failing workflow (shown in the lesson + issue title)'
+      run_id:
+        required: true
+        type: string
+        description: 'Run ID of the FAILED workflow run to mine logs from (github.event.workflow_run.id)'
+      run_url:
+        required: false
+        type: string
+        default: ''
+        description: 'Direct URL to the failing run (github.event.workflow_run.html_url)'
+      head_sha:
+        required: false
+        type: string
+        default: ''
+        description: 'SHA the failed run executed against'
+      repo:
+        required: false
+        type: string
+        default: ''
+        description: 'owner/repo — defaults to the calling repo (github.repository)'
+      draft_model:
+        required: false
+        type: string
+        default: 'gemini-2.5-flash'
+        description: 'ait-ai-gateway model used to draft the lesson. See header note — do not default to deepseek-chat for PII-gated callers.'
+      gateway_url:
+        required: false
+        type: string
+        default: 'https://ait-ai-gateway-jcxklz7ilq-uc.a.run.app'
+      kb_api_url:
+        required: false
+        type: string
+        default: 'https://kb-api-jcxklz7ilq-uc.a.run.app'
+      gsm_project:
+        required: false
+        type: string
+        default: 'intelligent-group-ait'
+    secrets:
+      LITELLM_VIRTUAL_KEY:
+        required: false
+        description: 'ait-ai-gateway virtual key for the calling repo. Missing -> draft step falls back to a templated lesson (WARN, not a failure).'
+      GCP_WORKLOAD_IDENTITY_PROVIDER:
+        required: false
+        description: 'Missing -> KB write step is skipped (WARN). Issue is still opened.'
+      GCP_SERVICE_ACCOUNT:
+        required: false
+
+jobs:
+  learn:
+    name: 'Learning loop: mine failure -> draft lesson -> KB + issue'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Resolve target repo
+        id: ctx
+        env:
+          INPUT_REPO: ${{ inputs.repo }}
+        run: |
+          REPO="${INPUT_REPO:-${{ github.repository }}}"
+          echo "repo=${REPO}" >> "$GITHUB_OUTPUT"
+          echo "run_url=${{ inputs.run_url }}" >> "$GITHUB_OUTPUT"
+
+      - name: Mine failure — pull failed job names + log excerpt
+        id: mine
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ steps.ctx.outputs.repo }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set +e
+          FAILED_JOBS=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
+            --jq '[.jobs[] | select(.conclusion=="failure") | .name] | join(", ")' 2>/dev/null)
+          if [ -z "$FAILED_JOBS" ]; then
+            FAILED_JOBS="(unknown — job list unavailable)"
+          fi
+
+          LOG_RAW=$(gh run view "${RUN_ID}" --repo "${REPO}" --log-failed 2>/dev/null)
+          if [ -z "$LOG_RAW" ]; then
+            echo "::warning::Could not fetch failed-step logs for run ${RUN_ID} in ${REPO} — continuing with a job-name-only summary"
+            LOG_RAW="(log excerpt unavailable — gh run view --log-failed returned nothing, possibly expired or permission-scoped)"
+          fi
+
+          # Strip ANSI + keep last ~100 lines so the excerpt is small enough
+          # for the LLM prompt and the eventual issue/KB body.
+          printf '%s' "$LOG_RAW" | sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tail -n 100 > /tmp/log_excerpt.txt
+
+          {
+            echo "failed_jobs<<EOF_FJ"
+            echo "$FAILED_JOBS"
+            echo "EOF_FJ"
+          } >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: Generate signature slug
+        id: slug
+        env:
+          WORKFLOW_NAME: ${{ inputs.workflow_name }}
+          REPO: ${{ steps.ctx.outputs.repo }}
+        run: |
+          # Signature-based, not run-id-based: repeats of the SAME failure
+          # class (workflow name + repo) upsert the same KB doc / issue
+          # instead of flooding the KB with one row per run.
+          RAW="ci-failure-${REPO}-${WORKFLOW_NAME}"
+          SLUG=$(printf '%s' "$RAW" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g' | cut -c1-200)
+          echo "slug=${SLUG}" >> "$GITHUB_OUTPUT"
+
+      - name: Draft lesson via ait-ai-gateway (best-effort)
+        id: draft
+        env:
+          GATEWAY_URL: ${{ inputs.gateway_url }}
+          DRAFT_MODEL: ${{ inputs.draft_model }}
+          LITELLM_VIRTUAL_KEY: ${{ secrets.LITELLM_VIRTUAL_KEY }}
+          WORKFLOW_NAME: ${{ inputs.workflow_name }}
+          REPO: ${{ steps.ctx.outputs.repo }}
+          RUN_URL: ${{ steps.ctx.outputs.run_url }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          FAILED_JOBS: ${{ steps.mine.outputs.failed_jobs }}
+        run: |
+          set +e
+          FALLBACK() {
+            echo "::warning::$1 — falling back to a templated (non-LLM) lesson body"
+            {
+              echo "# CI failure: ${WORKFLOW_NAME} (${REPO})"
+              echo ""
+              echo "**Failed job(s):** ${FAILED_JOBS}"
+              echo "**Run:** ${RUN_URL}"
+              echo "**SHA:** ${HEAD_SHA}"
+              echo ""
+              echo "## Error excerpt"
+              echo '```'
+              cat /tmp/log_excerpt.txt
+              echo '```'
+              echo ""
+              echo "_Drafted without LLM enrichment — see warning above for why._"
+            } > /tmp/lesson_body.md
+          }
+
+          if [ -z "${LITELLM_VIRTUAL_KEY}" ]; then
+            FALLBACK "LITELLM_VIRTUAL_KEY not set on the calling repo"
+            exit 0
+          fi
+
+          SYSTEM_PROMPT='You write short, high-signal engineering lessons in the "feedback_" memory format used at Intelligent Group: a 1-line RULE, then 2-4 sentences of WHY grounded strictly in the provided log excerpt. Do not invent root causes not evidenced in the excerpt. No secrets, no fabricated file paths.'
+          USER_PROMPT=$(printf 'Workflow "%s" failed in %s.\nFailed job(s): %s\nRun: %s\nSHA: %s\n\nLast log lines:\n%s\n\nDraft a lesson: a one-sentence RULE, then a short WHY paragraph, then a "Recommended guardrail" bullet.' \
+            "$WORKFLOW_NAME" "$REPO" "$FAILED_JOBS" "$RUN_URL" "$HEAD_SHA" "$(cat /tmp/log_excerpt.txt)")
+
+          REQ_BODY=$(jq -n \
+            --arg model "$DRAFT_MODEL" \
+            --arg sys "$SYSTEM_PROMPT" \
+            --arg usr "$USER_PROMPT" \
+            '{model: $model, messages: [{role:"system",content:$sys},{role:"user",content:$usr}], max_tokens: 500, temperature: 0.2}')
+
+          HTTP_CODE=$(curl -s -o /tmp/gateway_resp.json -w '%{http_code}' \
+            --max-time 30 \
+            -X POST "${GATEWAY_URL}/v1/chat/completions" \
+            -H "Authorization: Bearer ${LITELLM_VIRTUAL_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "$REQ_BODY")
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            FALLBACK "ait-ai-gateway returned HTTP ${HTTP_CODE} for model ${DRAFT_MODEL}"
+            exit 0
+          fi
+
+          DRAFTED=$(jq -r '.choices[0].message.content // empty' /tmp/gateway_resp.json 2>/dev/null)
+          if [ -z "$DRAFTED" ]; then
+            FALLBACK "ait-ai-gateway response had no parseable choices[0].message.content"
+            exit 0
+          fi
+
+          {
+            echo "# CI failure: ${WORKFLOW_NAME} (${REPO})"
+            echo ""
+            echo "**Failed job(s):** ${FAILED_JOBS}"
+            echo "**Run:** ${RUN_URL}"
+            echo "**SHA:** ${HEAD_SHA}"
+            echo ""
+            echo "$DRAFTED"
+            echo ""
+            echo "## Error excerpt"
+            echo '```'
+            cat /tmp/log_excerpt.txt
+            echo '```'
+          } > /tmp/lesson_body.md
+          set -e
+
+      - name: Write lesson to central KB (best-effort, fail-open)
+        id: kb
+        env:
+          KB_API_URL: ${{ inputs.kb_api_url }}
+          GSM_PROJECT: ${{ inputs.gsm_project }}
+          WIF_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          WIF_SA: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          WORKFLOW_NAME: ${{ inputs.workflow_name }}
+          REPO: ${{ steps.ctx.outputs.repo }}
+          RUN_URL: ${{ steps.ctx.outputs.run_url }}
+          RUN_ID: ${{ inputs.run_id }}
+          SLUG: ${{ steps.slug.outputs.slug }}
+        run: |
+          set +e
+          if [ -z "${WIF_PROVIDER}" ] || [ -z "${WIF_SA}" ]; then
+            echo "::warning::GCP_WORKLOAD_IDENTITY_PROVIDER / GCP_SERVICE_ACCOUNT not set on the calling repo — skipping KB write. The issue below still carries the full lesson body."
+            echo "wif_ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "wif_ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to GCP (WIF)
+        if: steps.kb.outputs.wif_ok == 'true'
+        uses: google-github-actions/auth@v2
+        continue-on-error: true
+        id: gcpauth
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        if: steps.kb.outputs.wif_ok == 'true' && steps.gcpauth.outcome == 'success'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch KB service-role key + POST lesson
+        if: steps.kb.outputs.wif_ok == 'true'
+        id: kbpost
+        env:
+          KB_API_URL: ${{ inputs.kb_api_url }}
+          GSM_PROJECT: ${{ inputs.gsm_project }}
+          AUTH_OK: ${{ steps.gcpauth.outcome }}
+          WORKFLOW_NAME: ${{ inputs.workflow_name }}
+          REPO: ${{ steps.ctx.outputs.repo }}
+          RUN_URL: ${{ steps.ctx.outputs.run_url }}
+          RUN_ID: ${{ inputs.run_id }}
+          SLUG: ${{ steps.slug.outputs.slug }}
+        run: |
+          set +e
+          echo "kb_written=false" >> "$GITHUB_OUTPUT"
+
+          if [ "$AUTH_OK" != "success" ]; then
+            echo "::warning::WIF auth to GCP failed — skipping KB write (fail-open). Check GCP_WORKLOAD_IDENTITY_PROVIDER / GCP_SERVICE_ACCOUNT and that the SA has secretAccessor on supabase__ait-knowledge-base__service-role-key in ${GSM_PROJECT}."
+            exit 0
+          fi
+
+          SRK=$(gcloud secrets versions access latest \
+            --secret=supabase__ait-knowledge-base__service-role-key \
+            --project="${GSM_PROJECT}" 2>/dev/null | tr -d '\r\n')
+          if [ -z "$SRK" ]; then
+            echo "::warning::Could not fetch supabase__ait-knowledge-base__service-role-key from GSM project ${GSM_PROJECT} — skipping KB write (fail-open)."
+            exit 0
+          fi
+
+          TITLE="CI failure: ${WORKFLOW_NAME} (${REPO})"
+          SOURCE_PATH="learning-loop/${REPO}/${WORKFLOW_NAME}"
+
+          KB_BODY=$(jq -n \
+            --arg kind "lesson" \
+            --arg slug "$SLUG" \
+            --arg title "$TITLE" \
+            --arg source_path "$SOURCE_PATH" \
+            --rawfile content_md /tmp/lesson_body.md \
+            --arg source_repo "$REPO" \
+            --arg source_run "$RUN_URL" \
+            --arg run_id "$RUN_ID" \
+            --arg workflow_name "$WORKFLOW_NAME" \
+            '{
+              kind: $kind,
+              slug: $slug,
+              title: $title,
+              source_path: $source_path,
+              content_md: $content_md,
+              tags: ["ci-failure", "auto-ingested"],
+              visibility: "internal",
+              frontmatter: {
+                source_repo: $source_repo,
+                source_run: $source_run,
+                run_id: $run_id,
+                workflow_name: $workflow_name,
+                recurrence: 1
+              }
+            }')
+
+          HTTP_CODE=$(curl -s -o /tmp/kb_resp.json -w '%{http_code}' \
+            --max-time 30 \
+            -X POST "${KB_API_URL}/v1/documents" \
+            -H "Authorization: Bearer ${SRK}" \
+            -H "Content-Type: application/json" \
+            -d "$KB_BODY")
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            BODY_EXCERPT=$(cut -c1-300 /tmp/kb_resp.json 2>/dev/null)
+            echo "::warning::kb-api POST /v1/documents returned HTTP ${HTTP_CODE} for slug ${SLUG}: ${BODY_EXCERPT} — continuing without KB write (fail-open)."
+            exit 0
+          fi
+
+          echo "kb_written=true" >> "$GITHUB_OUTPUT"
+          echo "kb_url=${KB_API_URL}/v1/documents/lesson/${SLUG}" >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: Open or update the learning-loop issue (always runs — durable sink)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ steps.ctx.outputs.repo }}
+          WORKFLOW_NAME: ${{ inputs.workflow_name }}
+          RUN_URL: ${{ steps.ctx.outputs.run_url }}
+          SLUG: ${{ steps.slug.outputs.slug }}
+          KB_WRITTEN: ${{ steps.kbpost.outputs.kb_written }}
+          KB_URL: ${{ steps.kbpost.outputs.kb_url }}
+        run: |
+          set +e
+          gh label create "learning-loop" --repo "${REPO}" --color "5319e7" --description "Auto-opened by product-learning-loop.yml" 2>/dev/null || true
+
+          TITLE="[Learning Loop] ${WORKFLOW_NAME} failed — lesson ${SLUG}"
+          NOW=$(date -u '+%Y-%m-%d %H:%M UTC')
+
+          BODY_FILE=/tmp/issue_body.md
+          {
+            echo "## Learning Loop"
+            echo ""
+            echo "Workflow **${WORKFLOW_NAME}** failed in \`${REPO}\`."
+            echo ""
+            echo "**Run:** ${RUN_URL}"
+            if [ "$KB_WRITTEN" = "true" ]; then
+              echo "**Lesson in ait-kb:** ${KB_URL} (slug: \`${SLUG}\`, kind: lesson)"
+            else
+              echo "**Lesson in ait-kb:** NOT written this time (KB unreachable or unauthenticated — see workflow WARN annotations). Slug would be \`${SLUG}\`."
+            fi
+            echo ""
+            echo "---"
+            echo ""
+            if [ -f /tmp/lesson_body.md ]; then
+              cat /tmp/lesson_body.md
+            else
+              echo "(no lesson body captured)"
+            fi
+            echo ""
+            echo "---"
+            echo "_Auto-opened by product-learning-loop.yml. Do NOT auto-merge anything this triggers — review and close once triaged._"
+          } > "$BODY_FILE"
+
+          EXISTING=$(gh api "repos/${REPO}/issues" \
+            --method GET -f state=open -f labels=learning-loop \
+            --jq "[.[] | select(.title == \"${TITLE}\")] | first | .number // empty" 2>/dev/null)
+
+          if [ -n "$EXISTING" ]; then
+            gh api "repos/${REPO}/issues/${EXISTING}/comments" \
+              --method POST -f "body=Recurrence at ${NOW}. ${RUN_URL}" 2>/dev/null || true
+            echo "::notice::Updated existing learning-loop issue #${EXISTING}"
+          else
+            NEW_URL=$(gh issue create --repo "${REPO}" --title "${TITLE}" \
+              --body-file "$BODY_FILE" --label "learning-loop,automated" 2>/dev/null)
+            echo "::notice::Opened learning-loop issue: ${NEW_URL}"
+          fi
+          set -e
