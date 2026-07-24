@@ -44,10 +44,15 @@ on:
       GH_PR_TOKEN:
         required: false
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   mark-production-ready:
     name: 'Production Ready — ${{ inputs.product }}'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Permissions are inherited from the caller (qa-chrome-caller.yml sets
     # pull-requests:write, checks:read, contents:read at workflow level).
     # Job-level permissions: in workflow_call reusables causes startup_failure
