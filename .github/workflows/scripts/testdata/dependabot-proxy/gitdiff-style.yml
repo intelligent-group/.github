@@ -1,0 +1,164 @@
+# Self-test fixture: real content from ait-crm's supabase-preview.yml (branch
+# job, `preview-needed` step, git-diff-style skip-check), with the unrelated
+# "purge stale box-level git auth artifacts" step trimmed out -- it isn't
+# part of the skip-check pattern this proxy tests, and it referenced a
+# dotfile path pattern that trips this repo's own portability lint on commit.
+name: Supabase Preview Branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+jobs:
+  pick:
+    uses: intelligent-group/.github/.github/workflows/_pick-runner.yml@main
+    secrets: inherit  # passes APP_ID + APP_PRIVATE_KEY + RUNNER_QUERY_PAT (zero-rotation fallback)
+  branch:
+    needs: pick
+    runs-on: ${{ fromJSON(needs.pick.outputs.runs_on) }}
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+      SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Determine whether preview branch is needed
+        id: preview-needed
+        run: |
+          # Dependabot-triggered pull_request runs only get Dependabot secrets,
+          # not regular repo secrets, so SUPABASE_ACCESS_TOKEN/DB_PASSWORD/
+          # PROJECT_ID are empty and `supabase branches create` always fails
+          # with "Access token not provided" -- see the 2026-07 stuck-PR
+          # incident. A pure dependency bump never touches supabase/migrations/,
+          # so there's nothing for a preview DB branch to test; skip
+          # provisioning instead of granting a bot-triggered PR live DB creds.
+          #
+          # Uses `git diff` against a shallow-fetched base SHA rather than
+          # the GitHub API: dependabot-triggered pull_request runs get a
+          # restricted GITHUB_TOKEN that 404s on `pulls/{n}/files` on at
+          # least one sibling repo (ait-hosted-agents) -- avoid the token
+          # dependency entirely.
+          if [ "${{ github.actor }}" != "dependabot[bot]" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"; then
+            echo "::warning::could not fetch base SHA to diff — defaulting to skip=false (preview branch will still be attempted)"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! changed_files=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD); then
+            echo "::warning::git diff failed — defaulting to skip=false (preview branch will still be attempted)"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if echo "$changed_files" | grep -q '^supabase/migrations/'; then
+            echo "::notice::Dependabot PR touches supabase/migrations/ — preview branch still required"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Dependabot PR with no supabase/migrations/ changes — skipping preview branch provisioning (dependabot-triggered runs lack SUPABASE_* secrets)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check runner capabilities
+        id: caps
+        run: |
+          if command -v unzip >/dev/null 2>&1; then
+            echo "unzip=true" >> $GITHUB_OUTPUT
+          elif sudo -n true 2>/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y unzip
+            echo "unzip=true" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::unzip not available and passwordless sudo not configured on this runner — skipping Supabase preview"
+            echo "unzip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: supabase/setup-cli@v3
+        if: steps.caps.outputs.unzip == 'true'
+        with:
+          version: latest
+
+      - name: Create preview branch
+        if: github.event.action != 'closed' && steps.caps.outputs.unzip == 'true' && steps.preview-needed.outputs.skip != 'true'
+        run: |
+          # `--project-id` is not a real Supabase CLI flag (it's `--project-ref`);
+          # the old unconditional `|| echo` swallowed that wrong-flag error the
+          # same as a benign "already exists", so this gate was silently
+          # always-green fleet-wide and never actually created/tested a branch.
+          # Only swallow the known-benign case now; real errors fail the job.
+          #
+          # RETRY (2026-07-07): Supabase's branch-provisioning backend
+          # occasionally returns `409: {"message":"Failed to provision branch
+          # project"}` as a transient error — confirmed by a plain manual
+          # retry succeeding seconds later with zero config/quota changes
+          # (ait-crm branch "pr-1708": 409 at 16:08:46Z, identical command
+          # succeeded at 17:47:46Z). Supabase's own status page shows a
+          # recurring pattern of project/branch-provisioning incidents in
+          # Americas regions around this window. Retry with backoff instead
+          # of hard-failing CI on a one-off platform hiccup.
+          set +e
+          attempt=1
+          max_attempts=3
+          until [ $attempt -gt $max_attempts ]; do
+            output=$(supabase branches create "pr-${{ github.event.pull_request.number }}" \
+              --project-ref "$SUPABASE_PROJECT_ID" \
+              --experimental 2>&1)
+            code=$?
+            echo "$output"
+            if [ $code -eq 0 ]; then
+              break
+            fi
+            if echo "$output" | grep -qi "already exists"; then
+              echo "Branch may already exist — continuing"
+              code=0
+              break
+            fi
+            if [ $attempt -eq $max_attempts ]; then
+              break
+            fi
+            echo "::warning::supabase branches create failed on attempt $attempt/$max_attempts (may be a transient provisioning error) — retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+            attempt=$((attempt + 1))
+          done
+          set -e
+          if [ $code -ne 0 ]; then
+            echo "::error::supabase branches create failed after $max_attempts attempts (not a benign already-exists case)"
+            exit $code
+          fi
+
+      - name: Delete preview branch
+        if: github.event.action == 'closed' && steps.caps.outputs.unzip == 'true' && steps.preview-needed.outputs.skip != 'true'
+        run: |
+          set +e
+          attempt=1
+          max_attempts=3
+          until [ $attempt -gt $max_attempts ]; do
+            output=$(supabase branches delete "pr-${{ github.event.pull_request.number }}" \
+              --project-ref "$SUPABASE_PROJECT_ID" \
+              --experimental 2>&1)
+            code=$?
+            echo "$output"
+            if [ $code -eq 0 ]; then
+              break
+            fi
+            if echo "$output" | grep -qi "not found"; then
+              echo "Branch not found — continuing"
+              code=0
+              break
+            fi
+            if [ $attempt -eq $max_attempts ]; then
+              break
+            fi
+            echo "::warning::supabase branches delete failed on attempt $attempt/$max_attempts (may be a transient provisioning error) — retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+            attempt=$((attempt + 1))
+          done
+          set -e
+          if [ $code -ne 0 ]; then
+            echo "::error::supabase branches delete failed after $max_attempts attempts (not a benign not-found case)"
+            exit $code
+          fi

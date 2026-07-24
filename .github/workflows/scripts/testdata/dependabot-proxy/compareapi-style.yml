@@ -1,0 +1,132 @@
+name: Supabase Preview Branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+jobs:
+  branch:
+    runs-on: [self-hosted, mroot-self-hosted]
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+      SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Determine whether preview branch is needed
+        id: skip_check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # NOTE: this runner has no `git` binary in PATH (actions/checkout falls
+          # back to a REST API archive download here -- no .git directory exists),
+          # so `git diff`/`git rev-parse` always fail and would silently push this
+          # check into its safe fallback (skip=false) on every dependabot run.
+          # Use the GitHub Compare-commits API instead, which only needs
+          # `contents: read` -- the one scope dependabot-triggered runs actually
+          # get (confirmed: they lack `pull-requests: read`, so `gh api
+          # pulls/{n}/files` 404s here even though `gh` itself works).
+          skip=false
+          if [ "${{ github.actor }}" = "dependabot[bot]" ]; then
+            base_sha="${{ github.event.pull_request.base.sha }}"
+            head_sha="${{ github.event.pull_request.head.sha }}"
+            response=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/compare/${base_sha}...${head_sha}") || response=""
+            if [ -n "$response" ]; then
+              changed=$(echo "$response" | grep -oE '"filename": ?"[^"]+"' | sed -E 's/"filename": ?"//; s/"$//')
+              if [ -n "$changed" ] && ! echo "$changed" | grep -qE '^(supabase/migrations/|packages/shared/prisma/migrations/)'; then
+                skip=true
+                echo "::notice::Dependabot PR touches no migration files (supabase/migrations/ or packages/shared/prisma/migrations/) -- skipping Supabase preview branch provisioning"
+              fi
+            else
+              echo "::warning::Could not fetch PR diff via Compare API -- defaulting to normal preview-branch provisioning"
+            fi
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
+      - uses: supabase/setup-cli@v2
+        if: steps.skip_check.outputs.skip != 'true'
+        with:
+          version: latest
+
+      - name: Create preview branch
+        if: github.event.action != 'closed' && steps.skip_check.outputs.skip != 'true'
+        run: |
+          # `--project-id` is not a real Supabase CLI flag (it's `--project-ref`);
+          # the old unconditional `|| echo` swallowed that wrong-flag error the
+          # same as a benign "already exists", so this gate was silently
+          # always-green fleet-wide and never actually created/tested a branch.
+          # Only swallow the known-benign case now; real errors fail the job.
+          #
+          # RETRY (2026-07-07): Supabase's branch-provisioning backend
+          # occasionally returns `409: {"message":"Failed to provision branch
+          # project"}` as a transient error -- confirmed fleet-wide (ait-crm
+          # PR #1711, AiTBMS same-day hit). Retry with backoff instead of
+          # hard-failing CI on a one-off platform hiccup.
+          set +e
+          attempt=1
+          max_attempts=3
+          until [ $attempt -gt $max_attempts ]; do
+            output=$(supabase branches create "pr-${{ github.event.pull_request.number }}" \
+              --project-ref "$SUPABASE_PROJECT_ID" \
+              --experimental 2>&1)
+            code=$?
+            echo "$output"
+            if [ $code -eq 0 ]; then
+              break
+            fi
+            if echo "$output" | grep -qi "already exists"; then
+              echo "Branch may already exist -- continuing"
+              code=0
+              break
+            fi
+            if [ $attempt -eq $max_attempts ]; then
+              break
+            fi
+            echo "::warning::supabase branches create failed on attempt $attempt/$max_attempts (may be a transient provisioning error) -- retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+            attempt=$((attempt + 1))
+          done
+          set -e
+          if [ $code -ne 0 ]; then
+            echo "::error::supabase branches create failed after $max_attempts attempts (not a benign already-exists case)"
+            exit $code
+          fi
+
+      - name: Delete preview branch
+        if: github.event.action == 'closed' && steps.skip_check.outputs.skip != 'true'
+        run: |
+          set +e
+          attempt=1
+          max_attempts=3
+          until [ $attempt -gt $max_attempts ]; do
+            output=$(supabase branches delete "pr-${{ github.event.pull_request.number }}" \
+              --project-ref "$SUPABASE_PROJECT_ID" \
+              --experimental 2>&1)
+            code=$?
+            echo "$output"
+            if [ $code -eq 0 ]; then
+              break
+            fi
+            if echo "$output" | grep -qi "not found"; then
+              echo "Branch not found -- continuing"
+              code=0
+              break
+            fi
+            if [ $attempt -eq $max_attempts ]; then
+              break
+            fi
+            echo "::warning::supabase branches delete failed on attempt $attempt/$max_attempts (may be a transient provisioning error) -- retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+            attempt=$((attempt + 1))
+          done
+          set -e
+          if [ $code -ne 0 ]; then
+            echo "::error::supabase branches delete failed after $max_attempts attempts (not a benign not-found case)"
+            exit $code
+          fi

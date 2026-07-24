@@ -1,0 +1,236 @@
+name: Dependabot-context proxy test
+
+# PROXY test (approximation, not a byte-identical simulation) for the class of
+# bug where a `pull_request` job assumes secrets/token-scope that a
+# dependabot[bot]-triggered `pull_request` run does NOT actually get. GitHub
+# restricts both custom repo secrets AND the auto-generated GITHUB_TOKEN's
+# scope on bot-triggered PR runs (unless a secret is explicitly added to the
+# Dependabot secrets store). Root-cause incident:
+# Plan-Item: fleet-dependabot-supabase-branch-secret-2026-07 (ait-crm #1840,
+# ait-soc-sentinel #770/#771/#772, ait-crm #1857).
+#
+# SCOPE (read before extending): this recognizes exactly ONE concrete
+# pattern, already found 3x in the fleet -- a job step that computes
+# `skip=<true|false>` via `git diff`/GitHub Compare-API against the PR's
+# base/head SHA, gated on `github.actor == 'dependabot[bot]'`, whose output
+# gates later secret-using / mutating steps (`steps.<id>.outputs.skip`).
+# It does NOT attempt to generically execute arbitrary workflow steps.
+#
+# WHAT THIS CATCHES (validated against real fleet fixtures — see self-test
+# below and PR body for the exact commands/results):
+#   1. The skip-check step computing cleanly WITHOUT any custom secrets in
+#      scope (dependabot-triggered runs never receive them) — this is an
+#      absence-of-crash assertion, not a "secret was missing" assertion,
+#      since the skip-check step itself doesn't consume SUPABASE_*/DIRECT_URL.
+#   2. Token-scope failures: a step calling an endpoint that needs more than
+#      `contents: read` (e.g. `gh api pulls/{n}/files`, which needs
+#      `pull-requests: read`) fails loudly under this job's restricted
+#      `permissions: contents: read` token — this job's GITHUB_TOKEN is
+#      genuinely scope-limited, not a fixture stand-in, so this is a live
+#      proof, not a simulation of one.
+#   4. An ungated dependent step (e.g. a CLI install) between the skip-check
+#      and the last gated mutating step, whose OWN failure would abort the
+#      job before the (correctly gated) mutating step is ever reached — this
+#      is a static-analysis assertion (`--mode static-only`), not something
+#      the live re-execution alone can prove, since re-running only the
+#      skip-check step never exercises later steps.
+#
+# WHAT THIS DOES NOT CATCH:
+#   Class 3 — a self-hosted runner image missing the `git` binary in PATH
+#   (actions/checkout falls back to a REST-API archive download with no
+#   .git directory, so `git diff`/`git rev-parse` always fail). That's a
+#   runner-IMAGE consistency issue, not a token/secrets-scope issue, and is
+#   out of scope for this proxy by design. Fix that class via runner-image
+#   provisioning / a runner-image lint, not this workflow.
+#
+# NOT BYTE-IDENTICAL TO DEPENDABOT'S REAL CONTEXT: a true simulation needs a
+# GitHub App installation token scoped down to match dependabot's actual
+# grant, which requires expanding the existing runner-picker App's
+# permissions (`contents: read` + possibly `actions: read`) in the GitHub
+# org admin console — an admin-console-only action outside CI/CLI authority.
+# BLOCKED UPGRADE PATH — needs Manuel: grant those two permissions to the
+# App used by _pick-runner.yml (see that file's AUTH HIERARCHY comment),
+# then this workflow can mint a real dependabot-shaped installation token
+# instead of relying on GITHUB_TOKEN + `permissions:` restriction as the
+# approximation.
+#
+# Consumer pattern (report-only; matches the WARN-baseline discipline used
+# fleet-wide for new gates until proven stable):
+#
+#   jobs:
+#     dependabot-proxy:
+#       if: github.event_name == 'pull_request'
+#       uses: intelligent-group/.github/.github/workflows/_dependabot-context-proxy.yml@main
+#       continue-on-error: true
+#       with:
+#         target_workflow_path: .github/workflows/supabase-preview.yml
+
+on:
+  workflow_call:
+    inputs:
+      target_workflow_path:
+        description: "Path (relative to repo root) to the workflow file whose dependabot skip-check step should be proxy-tested, e.g. .github/workflows/supabase-preview.yml"
+        required: false
+        type: string
+        # No skip-check step lives in this file -- every step below passes
+        # --allow-not-found, so an un-set/default target just becomes a
+        # no-op main check while the self-test (below, independent of this
+        # input) still runs for real. This default only matters for the
+        # self-triggering push/pull_request runs on THIS repo (see `on:`
+        # below); real callers always pass their own target_workflow_path.
+        default: .github/workflows/_dependabot-context-proxy.yml
+      target_ref:
+        description: "Git ref/SHA to check out before extracting the target file. Defaults to the caller's own ref -- override to pin an old (pre-fix) commit for validation runs."
+        required: false
+        type: string
+        default: ${{ github.sha }}
+      migration_test_path:
+        description: "Path used to author the synthetic 'with-migration' fixture commit. Override when the target repo's migration-relevant path isn't under supabase/migrations/."
+        required: false
+        type: string
+        default: "supabase/migrations/00000000000000_dependabot_proxy_test.sql"
+      skip_synthetic_scenarios:
+        description: "When true, skip the synthetic no-migration/with-migration fixture pair (useful if migration_test_path doesn't match this repo's convention) and only run the real-shas smoke test + static gate check."
+        required: false
+        type: boolean
+        default: false
+  # Self-test on changes to the proxy itself, so it can't rot silently and so
+  # this repo's own PRs get a REAL GitHub Actions-triggered run (not just a
+  # local reproduction) as validation -- same convention as
+  # npmci-browser-hang-gate.yml in this repo.
+  push:
+    paths:
+      - '.github/workflows/_dependabot-context-proxy.yml'
+      - '.github/workflows/scripts/dependabot_context_proxy.py'
+      - '.github/workflows/scripts/testdata/dependabot-proxy/**'
+  pull_request:
+    paths:
+      - '.github/workflows/_dependabot-context-proxy.yml'
+      - '.github/workflows/scripts/dependabot_context_proxy.py'
+      - '.github/workflows/scripts/testdata/dependabot-proxy/**'
+
+# Deliberately NOT `secrets: inherit` and NOT requesting any custom secret --
+# this job only ever sees GITHUB_TOKEN, scoped down by the block below. This
+# absence + restriction IS the mechanism that approximates dependabot's
+# real restricted context; it is a real, native GitHub Actions capability,
+# not a hack.
+permissions:
+  contents: read
+
+jobs:
+  proxy:
+    name: dependabot-context proxy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyYAML
+        run: pip install --quiet pyyaml
+        timeout-minutes: 2
+
+      - name: Resolve script (works when called from a product repo)
+        id: script
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -f .github/workflows/scripts/dependabot_context_proxy.py ]; then
+            echo "path=.github/workflows/scripts/dependabot_context_proxy.py" >> "$GITHUB_OUTPUT"
+          else
+            mkdir -p .gate
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github.raw" \
+              "https://api.github.com/repos/intelligent-group/.github/contents/.github/workflows/scripts/dependabot_context_proxy.py?ref=main" \
+              -o .gate/dependabot_context_proxy.py
+            echo "path=.gate/dependabot_context_proxy.py" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve target (workflow_call inputs are empty on push/pull_request self-trigger)
+        id: target
+        run: |
+          set -euo pipefail
+          target="${{ inputs.target_workflow_path }}"
+          echo "path=${target:-.github/workflows/_dependabot-context-proxy.yml}" >> "$GITHUB_OUTPUT"
+
+      - name: Static gate check (class 4 — ungated dependent steps)
+        run: python "${{ steps.script.outputs.path }}" --target "${{ steps.target.outputs.path }}" --mode static-only --allow-not-found --repository "${{ github.repository }}"
+
+      - name: Synthetic no-migration scenario (expect skip=true)
+        if: ${{ !inputs.skip_synthetic_scenarios }}
+        run: python "${{ steps.script.outputs.path }}" --target "${{ steps.target.outputs.path }}" --mode synthetic-no-migration --expect-skip true --allow-not-found --migration-test-path "${{ inputs.migration_test_path }}" --repository "${{ github.repository }}"
+
+      - name: Synthetic with-migration scenario (expect skip=false)
+        if: ${{ !inputs.skip_synthetic_scenarios }}
+        run: python "${{ steps.script.outputs.path }}" --target "${{ steps.target.outputs.path }}" --mode synthetic-with-migration --expect-skip false --allow-not-found --migration-test-path "${{ inputs.migration_test_path }}" --repository "${{ github.repository }}"
+
+      - name: Real-SHA smoke test (class 2 — restricted-token live proof)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          base_sha="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          head_sha="$(git rev-parse HEAD)"
+          python "${{ steps.script.outputs.path }}" --target "${{ steps.target.outputs.path }}" --mode real-shas \
+            --base-sha "$base_sha" --head-sha "$head_sha" --allow-not-found \
+            --repository "${{ github.repository }}" --github-token "$GITHUB_TOKEN"
+
+      - name: Self-test against committed fleet fixtures
+        if: ${{ github.repository == 'intelligent-group/.github' }}
+        run: |
+          set -euo pipefail
+          script="$(pwd)/.github/workflows/scripts/dependabot_context_proxy.py"
+          fixtures="$(pwd)/.github/workflows/scripts/testdata/dependabot-proxy"
+
+          echo "--- self-test 1: class-4 PRE-fix fixture must FAIL loudly ---"
+          if python "$script" --target "$fixtures/class4-prefix-ungated.yml" --mode static-only; then
+            echo "SELF-TEST FAILED: static-only did not flag the ungated class-4 fixture"; exit 1
+          fi
+
+          echo "--- self-test 2: class-4 POST-fix fixture must PASS ---"
+          python "$script" --target "$fixtures/class4-postfix-gated.yml" --mode static-only
+
+          echo "--- self-test 3: git-diff-style skip-check, synthetic no-migration -> skip=true ---"
+          python "$script" --target "$fixtures/gitdiff-style.yml" --mode synthetic-no-migration --expect-skip true
+
+          echo "--- self-test 4: git-diff-style skip-check, synthetic with-migration -> skip=false ---"
+          python "$script" --target "$fixtures/gitdiff-style.yml" --mode synthetic-with-migration --expect-skip false
+
+          echo "--- self-test 5: Compare-API-style skip-check survives under restricted token ---"
+          base_sha="$(git rev-parse HEAD~1)"
+          head_sha="$(git rev-parse HEAD)"
+          python "$script" --target "$fixtures/compareapi-style.yml" --mode real-shas \
+            --base-sha "$base_sha" --head-sha "$head_sha" \
+            --repository "${{ github.repository }}" --github-token "${{ secrets.GITHUB_TOKEN }}"
+
+          # "Class 5" (team-lead confirmed 2026-07-16): ait-crm deploy.yml's
+          # migrate-check job -- same secrets-gap root cause as class 1, a
+          # different file/job (PR #1857). Real content, not synthetic. No
+          # pre-fix static-check fixture: unlike the class-4 case, this job's
+          # skip-check and all its gates shipped together in #1857 -- there's
+          # no earlier "skip-check exists but a step is ungated" state to
+          # capture. The pre-fix bug was "no skip-check existed at all, so
+          # the whole job ran unconditionally and crashed on missing
+          # DIRECT_URL" -- that's a full-job runtime failure outside this
+          # proxy's scope (it only extracts+executes the skip-check step
+          # itself, not the whole job), so it isn't asserted here rather
+          # than faked.
+          echo "--- self-test 6: deploy.yml migrate-check static gate check must PASS ---"
+          python "$script" --target "$fixtures/deploy-migrate-check-postfix.yml" --mode static-only
+
+          echo "--- self-test 7: deploy.yml migrate-check, synthetic no-migration -> skip=true ---"
+          python "$script" --target "$fixtures/deploy-migrate-check-postfix.yml" --mode synthetic-no-migration --expect-skip true \
+            --migration-test-path "packages/shared/prisma/migrations/00000000000000_dependabot_proxy_test.sql"
+
+          echo "--- self-test 8: deploy.yml migrate-check, synthetic with-migration -> skip=false ---"
+          python "$script" --target "$fixtures/deploy-migrate-check-postfix.yml" --mode synthetic-with-migration --expect-skip false \
+            --migration-test-path "packages/shared/prisma/migrations/00000000000000_dependabot_proxy_test.sql"
+
+          echo "self-test passed: class-4 pre/post fixtures correctly FAIL/PASS; all 3 real skip-check variants (git-diff x2, Compare-API) execute cleanly under restricted permissions: contents: read with no custom secrets"
