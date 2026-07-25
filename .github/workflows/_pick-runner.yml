@@ -155,9 +155,28 @@ on:
 # Root cause is deeper: GITHUB_TOKEN structurally cannot call the runners API.
 # Solution is a PAT passed via secrets.runner_query_pat (see comment above).
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+# NOTE: do NOT add a concurrency: block here either. PR #44 (2026-07-24) added
+# one -- `group: ${{ github.workflow }}-${{ github.ref }}` -- to bring this
+# workflow in line with the org-wide ubuntu-latest cost-runaway antibody.
+# That broke every consumer org-wide: inside a workflow_call, `github.workflow`
+# resolves to the CALLING workflow's name, not this file's own `name: Pick
+# runner` -- so the group is byte-identical to the group the caller has
+# already declared on itself (every consumer of this reusable follows the
+# same `concurrency: group: ${{ github.workflow }}-${{ github.ref }}` pattern,
+# e.g. intelligentio/qa.yml, ait-crm/qa-gate-6-auth-smoke.yml). The `pick` job
+# therefore collides with its own still-running caller and cancel-in-progress
+# kills it before a single check-run is created -- not "skipped", not
+# "cancelled" in the UI, just absent. Every `needs: pick` job cascade-skips,
+# and any `if: always()` aggregator downstream (e.g. qa-status) correctly
+# reports failure since QA never ran. Confirmed via before/after bisection of
+# run history on intelligentio and ait-crm, both broken at exactly
+# 2026-07-24T21:40:27Z (fd511ad96). The reusable does not need its own
+# concurrency group -- the calling workflow's group already supersedes stale
+# runs of the whole run (pick included); a duplicate identical group here
+# only self-collides. If per-job cancellation of stale `pick` runs is ever
+# needed, scope the group to something that can't collide with the caller,
+# e.g. `pick-${{ github.run_id }}` (unique per run, so cancel-in-progress
+# becomes a no-op) -- not `${{ github.workflow }}-${{ github.ref }}`.
 
 jobs:
   pick:
