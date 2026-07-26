@@ -267,6 +267,40 @@ jobs:
           set -e
           exit $INSTALL_EXIT
 
+      - name: Verify Playwright project resolves (fail-fast guard)
+        # ROOT CAUSE (found 2026-07-24, ait-crm PR #1953): `playwright_command`
+        # defaults to `--project=chromium`, which assumes every caller's
+        # playwright.config.ts has a project literally NAMED "chromium". Most
+        # repos in this org follow that convention, but a repo using semantic
+        # project names instead (e.g. ait-crm's "authenticated"/"public"/
+        # "setup") gets a Playwright CLI error at the project-lookup step,
+        # before any test executes. That error looks identical to a normal
+        # failing "Run Chrome tests" step below, so the gate silently never
+        # runs its real suite while still reading as a routine red check --
+        # exactly what happened to ait-crm's chrome-qa since its first
+        # commit. Fleet-wide audit (2026-07-24) confirmed every OTHER repo
+        # calling this reusable workflow already has a "chromium"-named
+        # project, so the default is intentionally left as-is here rather
+        # than changed (changing it would alter already-green behavior for
+        # 15 repos to fix a class of bug none of them currently have). This
+        # guard instead makes any FUTURE mismatch fail loudly and
+        # immediately with an actionable message, instead of silently
+        # producing a zero-tests-executed false-fail for weeks. It runs the
+        # exact same `playwright_command` with `--list` appended (lists
+        # matched tests, executes nothing), so it is a no-op for every repo
+        # where the project already resolves correctly today.
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          set +e
+          LIST_OUTPUT=$(${{ inputs.playwright_command }} --list 2>&1)
+          LIST_EXIT=$?
+          set -e
+          if [ $LIST_EXIT -ne 0 ] && echo "$LIST_OUTPUT" | grep -qi "not found"; then
+            echo "$LIST_OUTPUT"
+            echo "::error::playwright_command '${{ inputs.playwright_command }}' references a Playwright project that does not exist in this repo's playwright.config.ts (or working_directory '${{ inputs.working_directory }}' is wrong). Left unfixed, this gate would fail at the project-lookup step before executing any tests, and would silently look like a normal test failure instead of a configuration error -- see intelligent-group/ait-crm PR #1953. Fix: pass an explicit 'playwright_command' input in this repo's own qa-chrome-caller.yml with --project=<one of this repo's real project names>."
+            exit 1
+          fi
+
       - name: Run Chrome tests
         id: run
         if: steps.skip.outputs.skip != 'true'
