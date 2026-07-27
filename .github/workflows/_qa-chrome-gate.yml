@@ -362,7 +362,7 @@ jobs:
         with:
           name: chrome-qa-report-${{ inputs.product }}-${{ github.run_id }}
           path: ${{ inputs.working_directory }}/playwright-report/
-          retention-days: 14
+          retention-days: 7
           if-no-files-found: ignore
 
       - name: Log result to Supabase
