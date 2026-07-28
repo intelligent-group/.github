@@ -57,14 +57,11 @@ on:
       SLACK_WEBHOOK_DEV_ALERTS:
         required: false
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   open-grab-work-issue:
     name: 'Self-heal: open grab-work issue'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ig-self-hosted]  # TEMP-BILLING-OVERRIDE was: ubuntu-latest (revert when GitHub billing fixed)
     timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
