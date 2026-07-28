@@ -5,8 +5,32 @@ name: QA Chrome Gate (reusable)
 # Required org secrets (set at intelligent-group level):
 #   QA_SUPABASE_URL, QA_SUPABASE_SERVICE_ROLE_KEY
 #
-# Optional per-repo secrets:
-#   CLERK_TEST_USER_EMAIL, CLERK_TEST_USER_PASSWORD, PLAYWRIGHT_BASE_URL
+# Optional per-repo secrets — two supported auth patterns for the caller's
+# Playwright auth-setup step (see ait-crm's tests/e2e/helpers/auth.ts for the
+# reference implementation both patterns were pulled from):
+#   Pattern A (email/password UI flow):
+#     CLERK_TEST_USER_EMAIL, CLERK_TEST_USER_PASSWORD
+#   Pattern B (Clerk sign-in-ticket flow — bypasses new-device verification
+#   on production Clerk instances, preferred when both are set):
+#     E2E_CLERK_USER_ID, CLERK_SECRET_KEY
+#   Plus, independent of auth pattern:
+#     PLAYWRIGHT_BASE_URL
+#
+# ROOT CAUSE (2026-07-28, ait-crm run 30357579686): this workflow's job env
+# only ever forwarded Pattern A's two secrets. ait-crm's auth.setup.ts
+# actually reads Pattern B (E2E_CLERK_USER_ID + CLERK_SECRET_KEY, both
+# already present as ait-crm repo secrets) and only falls back to Pattern A
+# names. Because this reusable workflow never declared or forwarded the
+# Pattern B secrets, `secrets: inherit` had nothing matching to pass through
+# -- hasAuthCredentials() was always false for ait-crm regardless of secret
+# visibility -- so auth setup silently skipped every run, no
+# tests/e2e/.auth/user.json was ever written, and every [authenticated]-
+# project test failed with ENOENT reading that file. This was masked for
+# months by an unrelated pre-existing bug (wrong --project name, ait-crm PR
+# #1953) that failed the gate even earlier, before any test executed; fixing
+# #1953 on 2026-07-27 let the suite actually run and exposed this. Fix is
+# purely additive (new optional secrets + env forwarding) so it does not
+# change behavior for existing Pattern-A callers (ait-avatar-studio, helix).
 #
 # Caller must pass secrets explicitly or use secrets: inherit, e.g.:
 #   uses: intelligent-group/.github/.github/workflows/_qa-chrome-gate.yml@main
@@ -16,6 +40,8 @@ name: QA Chrome Gate (reusable)
 #     PLAYWRIGHT_BASE_URL: ${{ secrets.PLAYWRIGHT_BASE_URL }}
 #     CLERK_TEST_USER_EMAIL: ${{ secrets.CLERK_TEST_USER_EMAIL }}
 #     CLERK_TEST_USER_PASSWORD: ${{ secrets.CLERK_TEST_USER_PASSWORD }}
+#     E2E_CLERK_USER_ID: ${{ secrets.E2E_CLERK_USER_ID }}
+#     CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
 # OR use `secrets: inherit` if calling from same org.
 
 on:
@@ -57,6 +83,10 @@ on:
         required: false
       CLERK_TEST_USER_PASSWORD:
         required: false
+      E2E_CLERK_USER_ID:
+        required: false
+      CLERK_SECRET_KEY:
+        required: false
       QA_SUPABASE_URL:
         required: true
       QA_SUPABASE_SERVICE_ROLE_KEY:
@@ -93,6 +123,8 @@ jobs:
       PLAYWRIGHT_BASE_URL: ${{ secrets.PLAYWRIGHT_BASE_URL || inputs.product_url }}
       CLERK_TEST_USER_EMAIL: ${{ secrets.CLERK_TEST_USER_EMAIL }}
       CLERK_TEST_USER_PASSWORD: ${{ secrets.CLERK_TEST_USER_PASSWORD }}
+      E2E_CLERK_USER_ID: ${{ secrets.E2E_CLERK_USER_ID }}
+      CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
       CI: 'true'
 
     steps:
