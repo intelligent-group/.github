@@ -243,17 +243,36 @@ jobs:
           # curl (present on every runner flavor) and emit a loud notice
           # distinguishing a FAILED query from a genuinely empty fleet, so
           # this class of silent-empty can never masquerade as "no runners".
+          # 2026-07-27 (j): -sf alone silences curl's OWN diagnostic text on
+          # failure, not just the progress meter -- so every prior failure
+          # of this query (including the live one that amplified the
+          # billing block onto ait-crm PR #1989's dep-bump-preflight job,
+          # runner gh-aitbms-mig-8spg, 2026-07-27T21:02) only ever logged
+          # the generic "curl exit" notice with zero information about
+          # WHY (timeout under fleet load? DNS? TLS? a genuinely-expired
+          # PAT at that instant?). -S restores curl's own error text to
+          # stderr while keeping the progress meter suppressed; captured
+          # here into a file (stderr redirect inside the `if` conditional,
+          # so `set -e` from this run: block's shell invocation doesn't
+          # abort the function on a real failure -- same structure as
+          # before, just with the stderr now kept instead of discarded)
+          # and surfaced via ::warning:: so the NEXT time this fires, the
+          # log finally shows the real cause instead of forcing a guess.
+          # No decision-logic change -- pick-runner-decide.sh and the
+          # empty-list fallback behavior are untouched.
           runners_json() {
-            local out
-            if out="$(curl -sf --connect-timeout 10 --max-time 30 --retry 2 \
+            local out err_file
+            err_file="$(mktemp)"
+            if out="$(curl -sSf --connect-timeout 10 --max-time 30 --retry 2 \
                 -H "Authorization: token ${GH_TOKEN}" \
                 -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/orgs/${ORG}/actions/runners?per_page=100")"; then
+                "https://api.github.com/orgs/${ORG}/actions/runners?per_page=100" 2>"$err_file")"; then
               echo "$out"
             else
-              echo "::notice::runner query FAILED (curl exit) -- treating as empty list; check RUNNER_QUERY_PAT scope/value" >&2
+              echo "::warning::runner query FAILED -- curl stderr: $(tr '\n' ' ' < "$err_file") -- treating as empty list; check RUNNER_QUERY_PAT scope/value" >&2
               echo '{"runners":[]}'
             fi
+            rm -f "$err_file"
           }
 
           # 2026-07-22 (h): the Tier 1-4 decision logic (previously ~130
