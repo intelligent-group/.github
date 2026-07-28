@@ -358,6 +358,13 @@ jobs:
       - name: Upload HTML report
         id: upload
         if: steps.skip.outputs.skip != 'true' && always()
+        # Report-only step: the pass/fail verdict for this gate comes from
+        # "Finalize status" (steps.run.outputs.raw_status), not from this
+        # upload. Org artifact-storage-quota exhaustion (or any other
+        # upload-artifact infra failure) must never fail an otherwise-passing
+        # Chrome QA run — the HTML report is a human-review convenience, not
+        # part of the gate's correctness signal.
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: chrome-qa-report-${{ inputs.product }}-${{ github.run_id }}
