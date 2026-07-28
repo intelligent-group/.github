@@ -25,6 +25,13 @@ on:
         required: false
         type: boolean
         default: false
+    secrets:
+      RUNNER_QUERY_PAT:
+        description: >
+          Optional passthrough for _pick-runner.yml's runner-availability query.
+          Not required — omitting it just means this gate's own `pick` job
+          falls back to ubuntu-latest same as before.
+        required: false
   # Self-test on changes to the gate itself, so the linter can't rot silently.
   push:
     paths:
@@ -40,9 +47,19 @@ permissions:
 
 
 jobs:
+  # Billing-block fix (2026-07-22): see this same pattern already applied in
+  # _qa-production-ready.yml / _self-heal-on-failure.yml in this repo.
+  pick:
+    uses: ./.github/workflows/_pick-runner.yml
+    with:
+      weight: light
+    secrets:
+      runner_query_pat: ${{ secrets.RUNNER_QUERY_PAT }}
+
   lint:
     name: npm-ci hang gate
-    runs-on: ubuntu-latest
+    needs: [pick]
+    runs-on: ${{ fromJSON(needs.pick.outputs.runs_on) }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
