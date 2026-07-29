@@ -45,7 +45,7 @@ permissions:
 jobs:
   assert-runner-clis-smoke:
     name: "Smoke: assert-runner-clis"
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ig-self-hosted]  # TEMP-BILLING-OVERRIDE was: ubuntu-latest (revert when GitHub billing fixed)
     timeout-minutes: 3
     steps:
       - uses: actions/checkout@v4
