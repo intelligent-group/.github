@@ -389,6 +389,19 @@ jobs:
 
       - name: Upload HTML report
         id: upload
+        # ROOT CAUSE (2026-07-28, helix run 30361350850 + 30379420003, also
+        # reproduced on AiTBMS main run 30361658799): the org-wide GitHub
+        # Actions artifact storage quota was hit ("Usage is recalculated
+        # every 6-12 hours"), which fails this action step outright. Because
+        # this step had no continue-on-error, that storage-housekeeping
+        # failure failed the WHOLE job -- even for a run whose actual
+        # Playwright suite passed -- masking real pass/fail signal behind an
+        # unrelated billing/quota condition every caller repo has zero
+        # control over. The HTML report artifact is a nice-to-have debugging
+        # aid (Supabase logging below is the actual QA record), not part of
+        # the gate's pass/fail contract, so a failure to upload it must never
+        # flip an otherwise-passing "Chrome QA" check to red.
+        continue-on-error: true
         if: steps.skip.outputs.skip != 'true' && always()
         uses: actions/upload-artifact@v4
         with:
