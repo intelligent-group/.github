@@ -13,12 +13,22 @@
 #   stdin:  runners JSON, shape {"runners":[{status,busy,labels:[{name}]}...]}
 #           (the raw response body of GET /orgs/{org}/actions/runners, or the
 #           {"runners":[]} fallback on a failed query)
-#   env:    WEIGHT (optional, default "heavy") -- notice/telemetry text only,
-#           does not change which tier is reachable (see _pick-runner.yml
-#           history note 2026-07-22(f))
+#   env:    WEIGHT (optional, default "heavy").
+#           WEIGHT=light  -> early-exits to the always-on "persistent" pool
+#                            (routes light checks off the flaky ephemeral MIG;
+#                            see the light branch + 2026-07-29(k) note below);
+#                            falls back to ubuntu-latest only on a genuine
+#                            persistent-pool outage.
+#           WEIGHT=heavy  -> flows through the Tier 1-4 chain unchanged; here
+#                            weight is notice/telemetry text only and does not
+#                            change which tier is reachable (see _pick-runner.yml
+#                            history note 2026-07-22(f)).
 #   stdout: exactly two GITHUB_OUTPUT-format lines: runs_on=... / picked=...
 #           (safe to `>> "$GITHUB_OUTPUT"` directly)
 #   stderr: ::notice::/::warning:: workflow commands + diagnostic text
+#
+# WEIGHT=light short-circuits to the "persistent" pool before Tier 1 (see the
+# light branch below). The Tier 1-4 chain is the HEAVY path:
 #
 # Tier 1 -- PC online + IDLE          -> route to self-hosted, prefer PC
 # Tier 2 -- PC busy, MIG online+IDLE  -> route to self-hosted, prefer MIG
@@ -37,6 +47,48 @@ fi
 echo "weight=$WEIGHT" >&2
 
 RUNNERS="$(cat)"
+
+# ----- Light-weight jobs: route to the always-on "persistent" pool -----
+# 2026-07-29 (k): light checks (lint/typecheck/format/security-scan; <2min,
+# low CPU) are the majority of check-runs on most PRs and were the dominant
+# source of CI flakiness, because the Tier 1-4 chain below can land them on
+# the one-shot ephemeral cloud MIG runners (ig-org-runner-mig-*), which boot
+# mid-job, recycle under a running job, and race on registration. The 5
+# always-on self-hosted runners (gram-runner-1, gram-runner-2,
+# pc-ultra7-igorg, pc-ultra7-igorg-orglevel, pc-ultra7-mruser) now carry a
+# distinct "persistent" label; the ephemeral MIG runners do NOT. Route light
+# jobs to that stable pool.
+#
+# This is an INDEPENDENT detection, not a relabel of the Tier 1-4 outputs, on
+# purpose: the Tier 1-4 chain keys availability off pc-*/ig-self-hosted
+# labels, which are NOT a superset of the persistent pool -- gram-runner-1/2
+# carry no pc-* prefix. Simply swapping the emitted label to "persistent"
+# inside those tiers would let a Tier-2/3 branch (which fires on a MIG being
+# online) emit ["self-hosted","persistent"] while zero persistent runners are
+# up -- queueing against a dead pool. So light gets its own gate: emit the
+# persistent label ONLY when >=1 persistent runner is actually online, else
+# fall to ubuntu-latest (same final billing/outage fallback the heavy path
+# reaches at Tier 4). Heavy is untouched and flows through Tier 1-4 below.
+if [ "$WEIGHT" = "light" ]; then
+  PERSIST_ONLINE_COUNT=$(echo "$RUNNERS" | jq -r \
+    '[.runners[]? | select(.status=="online") | select([.labels[].name] | index("persistent"))] | length' \
+    | head -1)
+  # Same integer-hardening as Tier 3 (guards the 2026-07-22(g) multi-doc
+  # count-corruption shape: anything not a bare integer -> 0).
+  [[ "$PERSIST_ONLINE_COUNT" =~ ^[0-9]+$ ]] || PERSIST_ONLINE_COUNT=0
+  if [ "$PERSIST_ONLINE_COUNT" -gt 0 ]; then
+    echo "::notice::weight=light -- routing to always-on persistent pool (online=$PERSIST_ONLINE_COUNT) instead of ephemeral MIG; job queues natively if all busy" >&2
+    echo 'runs_on=["self-hosted","persistent"]'
+    echo 'picked=persistent'
+    exit 0
+  fi
+  echo "::notice::weight=light but ZERO persistent runners online -- final fallback to ubuntu-latest" >&2
+  echo 'runs_on=["ubuntu-latest"]'
+  echo 'picked=ubuntu-latest'
+  exit 0
+fi
+
+# ===== Heavy path: Tier 1-4 chain below is byte-for-byte unchanged. =====
 
 # ----- Tier 1: PC (any "pc-*" labeled runner), online + idle -----
 # Prefix match, not the dead exact-string "pc-cpu" -- see _pick-runner.yml

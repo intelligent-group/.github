@@ -16,6 +16,13 @@ name: Pick runner
 # Reusable workflow that decides where to land downstream jobs. End-to-end
 # decision tree (rewritten 2026-07-22, see history below):
 #
+#   weight=light → short-circuit to the always-on `persistent` pool
+#                  (["self-hosted","persistent"]); ubuntu-latest only if zero
+#                  persistent runners are online. Bypasses Tier 1-4 entirely
+#                  to keep light checks off the flaky ephemeral MIG runners.
+#                  Added 2026-07-29(k); see weight-behavior note below.
+#
+#   The Tier 1-4 chain below is the weight=heavy path:
 #   Tier 1 — PC online + IDLE          → route to self-hosted, prefer PC
 #   Tier 2 — PC busy, MIG online+IDLE  → route to self-hosted, prefer MIG
 #   Tier 3 — nothing idle, but PC or MIG is registered+ONLINE (just busy)
@@ -27,15 +34,30 @@ name: Pick runner
 #            outage, not merely "busy")
 #                                       → ubuntu-latest (final fallback)
 #
-# `weight` no longer changes which tier is reachable -- light and heavy both
-# get the full Tier 1-4 chain (see 2026-07-22(f): a weight=light-only
+# `weight` behavior (updated 2026-07-29(k)):
+#   - HEAVY flows through the full Tier 1-4 chain; for heavy, weight only
+#     affects notice/telemetry text and every self-hosted tier outputs the
+#     same runs_on label set (["self-hosted","ig-self-hosted"]). See the
+#     2026-07-22(b) label-bug note below for why a PC-specific target label
+#     isn't used even when Tier 1 is what actually matched.
+#   - LIGHT short-circuits BEFORE Tier 1 to the always-on "persistent" pool
+#     (the 5 stable self-hosted runners labeled `persistent`:
+#     gram-runner-1/2 + pc-ultra7-igorg/-orglevel/-mruser), outputting
+#     ["self-hosted","persistent"], and falls back to ubuntu-latest only on a
+#     genuine persistent-pool outage. This routes the high-volume light checks
+#     OFF the one-shot ephemeral cloud MIG runners (ig-org-runner-mig-*),
+#     whose boot-mid-job / recycle-under-job / registration-race behavior is
+#     the dominant source of light-tier CI flakiness. See
+#     scripts/pick-runner-decide.sh 2026-07-29(k) for why this is an
+#     independent persistent-availability gate rather than a relabel of the
+#     Tier 1-4 outputs.
+# NOTE (2026-07-22(f), still applies to the HEAVY path): a weight=light-only
 # "default to free ubuntu-latest, predict when it's blocked" tier was tried
-# and reverted -- the prediction was unreliable, a genuine race condition,
-# not just a scoping bug). It only affects notice/telemetry text. All
-# self-hosted tiers output the same runs_on label set
-# (["self-hosted","ig-self-hosted"]); see the 2026-07-22(b) label-bug note
-# below for why a PC-specific target label isn't used even when Tier 1 is
-# what actually matched.
+# and reverted -- the prediction was unreliable, a genuine race condition, not
+# just a scoping bug. The 2026-07-29(k) light routing does NOT predict
+# ubuntu-latest availability; it deterministically targets the always-on
+# persistent pool and only reaches ubuntu-latest when zero persistent runners
+# are online.
 #
 # History:
 #
@@ -145,7 +167,7 @@ on:
         description: "JSON array of labels to feed runs-on"
         value: ${{ jobs.pick.outputs.runs_on }}
       picked:
-        description: "Human-readable tier picked: 'pc' (idle), 'ig-self-hosted' (MIG, idle), 'ig-self-hosted-queued' (self-hosted busy but online, job will queue), or 'ubuntu-latest' (final fallback — no self-hosted runner online at all)"
+        description: "Human-readable tier picked: 'persistent' (weight=light routed to the always-on persistent pool), 'pc' (heavy, PC idle), 'ig-self-hosted' (heavy, MIG idle), 'ig-self-hosted-queued' (heavy, self-hosted busy but online, job will queue), or 'ubuntu-latest' (final fallback — light: zero persistent online; heavy: no self-hosted runner online at all)"
         value: ${{ jobs.pick.outputs.picked }}
 
 # NOTE: do NOT add workflow-level permissions: block here. The prior bisect
