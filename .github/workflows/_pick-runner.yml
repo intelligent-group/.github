@@ -17,9 +17,12 @@ name: Pick runner
 # decision tree (rewritten 2026-07-22, see history below):
 #
 #   weight=light → short-circuit to the always-on `persistent` pool
-#                  (["self-hosted","persistent"]); ubuntu-latest only if zero
-#                  persistent runners are online. Bypasses Tier 1-4 entirely
-#                  to keep light checks off the flaky ephemeral MIG runners.
+#                  (["self-hosted","persistent"]); if zero persistent runners
+#                  are online, fall back to the broader self-hosted pool
+#                  (["self-hosted","ig-self-hosted"], incl. cloud MIG) and
+#                  queue there -- NOT to billing-blocked ubuntu-latest
+#                  (2026-07-29(l)). Bypasses Tier 1-4 entirely to keep light
+#                  checks off the flaky ephemeral MIG runners.
 #                  Added 2026-07-29(k); see weight-behavior note below.
 #
 #   The Tier 1-4 chain below is the weight=heavy path:
@@ -43,8 +46,10 @@ name: Pick runner
 #   - LIGHT short-circuits BEFORE Tier 1 to the always-on "persistent" pool
 #     (the 5 stable self-hosted runners labeled `persistent`:
 #     gram-runner-1/2 + pc-ultra7-igorg/-orglevel/-mruser), outputting
-#     ["self-hosted","persistent"], and falls back to ubuntu-latest only on a
-#     genuine persistent-pool outage. This routes the high-volume light checks
+#     ["self-hosted","persistent"], and on a genuine persistent-pool outage
+#     falls back to the broader self-hosted pool (ig-self-hosted, incl. cloud
+#     MIG) and queues there -- NOT to billing-blocked ubuntu-latest
+#     (2026-07-29(l)). This routes the high-volume light checks
 #     OFF the one-shot ephemeral cloud MIG runners (ig-org-runner-mig-*),
 #     whose boot-mid-job / recycle-under-job / registration-race behavior is
 #     the dominant source of light-tier CI flakiness. See
@@ -56,8 +61,9 @@ name: Pick runner
 # and reverted -- the prediction was unreliable, a genuine race condition, not
 # just a scoping bug. The 2026-07-29(k) light routing does NOT predict
 # ubuntu-latest availability; it deterministically targets the always-on
-# persistent pool and only reaches ubuntu-latest when zero persistent runners
-# are online.
+# persistent pool, and on a persistent-pool outage queues on the broader
+# self-hosted pool -- the light path never lands on ubuntu-latest at all
+# (2026-07-29(l)).
 #
 # History:
 #
@@ -167,7 +173,7 @@ on:
         description: "JSON array of labels to feed runs-on"
         value: ${{ jobs.pick.outputs.runs_on }}
       picked:
-        description: "Human-readable tier picked: 'persistent' (weight=light routed to the always-on persistent pool), 'pc' (heavy, PC idle), 'ig-self-hosted' (heavy, MIG idle), 'ig-self-hosted-queued' (heavy, self-hosted busy but online, job will queue), or 'ubuntu-latest' (final fallback — light: zero persistent online; heavy: no self-hosted runner online at all)"
+        description: "Human-readable tier picked: 'persistent' (weight=light routed to the always-on persistent pool), 'pc' (heavy, PC idle), 'ig-self-hosted' (heavy, MIG idle), 'ig-self-hosted-queued' (heavy: self-hosted busy but online; OR weight=light fallback when zero persistent online — queues on the broader self-hosted pool), or 'ubuntu-latest' (heavy Tier-4 final fallback only — no self-hosted runner online at all; the light path never reaches ubuntu-latest)"
         value: ${{ jobs.pick.outputs.picked }}
 
 # NOTE: do NOT add workflow-level permissions: block here. The prior bisect

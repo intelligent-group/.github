@@ -17,8 +17,10 @@
 #           WEIGHT=light  -> early-exits to the always-on "persistent" pool
 #                            (routes light checks off the flaky ephemeral MIG;
 #                            see the light branch + 2026-07-29(k) note below);
-#                            falls back to ubuntu-latest only on a genuine
-#                            persistent-pool outage.
+#                            on a genuine persistent-pool outage it falls back
+#                            to the broader self-hosted pool (ig-self-hosted,
+#                            incl. cloud MIG) and queues there -- NOT to
+#                            billing-blocked ubuntu-latest (2026-07-29(l)).
 #           WEIGHT=heavy  -> flows through the Tier 1-4 chain unchanged; here
 #                            weight is notice/telemetry text only and does not
 #                            change which tier is reachable (see _pick-runner.yml
@@ -67,8 +69,14 @@ RUNNERS="$(cat)"
 # online) emit ["self-hosted","persistent"] while zero persistent runners are
 # up -- queueing against a dead pool. So light gets its own gate: emit the
 # persistent label ONLY when >=1 persistent runner is actually online, else
-# fall to ubuntu-latest (same final billing/outage fallback the heavy path
-# reaches at Tier 4). Heavy is untouched and flows through Tier 1-4 below.
+# fall back to the BROADER self-hosted pool (["self-hosted","ig-self-hosted"],
+# incl. cloud MIG) and QUEUE there -- NOT to ubuntu-latest. 2026-07-29(l):
+# ubuntu-latest is GitHub-hosted and is billing-blocked during the org-wide
+# GH Actions spend outage, so a light job that drops to it would fail/hang;
+# the self-hosted pool has no billing dependency, so queueing there is the
+# resilient light fallback. (This differs from the HEAVY path's Tier-4 final
+# fallback, which still goes to ubuntu-latest -- that path is untouched.)
+# Heavy is untouched and flows through Tier 1-4 below.
 if [ "$WEIGHT" = "light" ]; then
   PERSIST_ONLINE_COUNT=$(echo "$RUNNERS" | jq -r \
     '[.runners[]? | select(.status=="online") | select([.labels[].name] | index("persistent"))] | length' \
@@ -82,9 +90,9 @@ if [ "$WEIGHT" = "light" ]; then
     echo 'picked=persistent'
     exit 0
   fi
-  echo "::notice::weight=light but ZERO persistent runners online -- final fallback to ubuntu-latest" >&2
-  echo 'runs_on=["ubuntu-latest"]'
-  echo 'picked=ubuntu-latest'
+  echo "::notice::weight=light but ZERO persistent runners online -- falling back to the broader self-hosted pool (ig-self-hosted, incl. cloud MIG); job queues there rather than dropping to billing-blocked ubuntu-latest" >&2
+  echo 'runs_on=["self-hosted","ig-self-hosted"]'
+  echo 'picked=ig-self-hosted-queued'
   exit 0
 fi
 
