@@ -29,7 +29,7 @@ permissions:
 jobs:
   actionlint:
     name: actionlint — reusable workflows
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ig-self-hosted]  # TEMP-BILLING-OVERRIDE was: ubuntu-latest (revert when GitHub billing fixed)
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
