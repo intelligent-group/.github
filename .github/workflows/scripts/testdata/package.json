@@ -1,1 +1,0 @@
-{ "name": "npmci-hang-fixture", "devDependencies": { "playwright": "1.44.0", "astro": "4.0.0" } }
