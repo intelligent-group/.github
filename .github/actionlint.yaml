@@ -16,6 +16,7 @@ self-hosted-runner:
     - ig-self-hosted       # MIG (GPU-enabled cloud runner, ~$0.01/job amortized)
     - pc-cpu               # on-premises PC runner pool (preferred when online)
     - pc-ultra7-268v       # named PC box, used directly in ait-mailroom/runner-smoke.yml
+    - aitbms-runner        # MIG subset label (qa-gate-47 dead-controls, added 2026-08-02)
     # --- legacy / reserved labels, not currently used in any runs-on: literal,
     #     kept for compatibility with ad-hoc extra_labels fan-outs
     #     (runner-cli-bootstrap.yml, runner-hygiene.yml) that can target these
