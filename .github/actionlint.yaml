@@ -33,3 +33,15 @@ self-hosted-runner:
     - ig-org
     - ig-org-runner
     - mr-user
+    # --- per-runner NAME labels (target one box at a time; used by
+    #     runner-power-settings.yml's matrix). These landed in the
+    #     ait-claude-config copy 2026-08-04 after that workflow broke
+    #     actionlint on every PR, and were never synced back here --
+    #     which is the drift this file's own header warns about. ---
+    - gram-runner-1
+    - gram-runner-2
+    - gram2-1
+    - gram2-2
+    - samsung-runner-1
+    - samsung-runner-2
+    - pc-ultra7-igorg-orglevel
