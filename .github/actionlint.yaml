@@ -18,6 +18,8 @@ self-hosted-runner:
     - pc-ultra7-268v       # named PC box, used directly in ait-mailroom/runner-smoke.yml
     - aitbms-runner        # MIG subset label (qa-gate-47 dead-controls, added 2026-08-02)
     - ig-general           # renamed pool label (ait-claude-config#4709 phase 2/3; aitbms-runner kept until phase 3)
+    - ig-ephemeral         # POSITIVE label carried ONLY by ephemeral one-job MIG/spot runners (never persistent boxes), for jobs that must not run on persistent infra (secret-scan waivers); see ait-claude-config infra/runner-fleet/ig-ephemeral-label-scope.json. Backfilled from the ait-claude-config copy: a re-sync from this file would otherwise drop it and break lint.
+    - ig-multijob-canary   # carried ONLY by the multi-job (v41) canary runners on ig-org-runner-mig-small (RUNNER_EXTRA_LABELS metadata set by ait-claude-config infra/gh-runner-mig/multijob-canary.sh create-template); the cross-job leakage probe jobs in mig-recycle-proxy-eval.yml run-on it. Pool is size 0 at rest.
     - tier3-spot           # MIG spot runner, cost-optimized ephemeral compute for retry-tolerant Tier-3/nightly jobs. Already live in ait-crm's synced copy and used by ait-soc-sentinel#898 (qa-gate-13-broken-link.yml); backfilled here to stop the same drift this file's header warns about (gha-lib#38 tracks the opt-in pick-runner support).
     # --- legacy / reserved labels, not currently used in any runs-on: literal,
     #     kept for compatibility with ad-hoc extra_labels fan-outs
